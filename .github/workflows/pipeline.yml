@@ -1,0 +1,340 @@
+name: Pipeline
+
+# push to main : quality -> build/scan/smoke -> publish/sign -> staging -> [approval] -> production
+# pull request : quality -> build/scan/smoke   (nothing is published or deployed)
+#
+# Deployment is pull-based: the promotion jobs only commit to the
+# `environments` branch. The GitOps agent on AI-LAB applies those commits, so
+# no job here needs network access to, or credentials for, the homelab.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  # Cancel superseded PR runs; never cancel a main run mid-promotion.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Same package name as v1, so the existing public GHCR package is reused.
+  IMAGE_BASENAME: my-cicd-project
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  quality:
+    name: Lint, SAST, dependency audit, secret scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history for the secret scanner
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: Lockfile is up to date
+        run: uv lock --check
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Ruff (lint + format)
+        run: |
+          uv run ruff check --output-format=github .
+          uv run ruff format --check .
+
+      - name: Bandit (Python SAST)
+        run: uv run bandit -c pyproject.toml -r app -q
+
+      - name: pip-audit (known-vulnerable dependencies)
+        run: |
+          uv export --locked --no-dev --no-emit-project --format requirements-txt -o /tmp/requirements.txt
+          uv run pip-audit --strict --disable-pip --require-hashes -r /tmp/requirements.txt
+
+      - name: ShellCheck
+        run: shellcheck scripts/*.sh deploy/agent/*.sh tests/agent/*.sh
+
+      - name: GitOps agent scenario tests (rollback, gating, drift)
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.invalid
+          tests/agent/run.sh
+
+      - name: Compose files are valid
+        run: |
+          printf 'APP_IMAGE=example@sha256:%064d\nAPP_VERSION=0\nPOSTGRES_PASSWORD=x\n' 0 > /tmp/ci.env
+          for env in staging production; do
+            docker compose -f deploy/compose/compose.yaml \
+              --env-file deploy/compose/$env.env --env-file /tmp/ci.env config --quiet
+          done
+          GRAFANA_ADMIN_PASSWORD=x docker compose -f deploy/observability/compose.yaml config --quiet
+
+      - name: TruffleHog (verified secrets)
+        uses: trufflesecurity/trufflehog@4dd8831c5f12599465d4d45c3c447b4018a34c85 # v3.97.9
+        with:
+          extra_args: --results=verified,unknown
+
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests (Postgres integration)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: app_test
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U app -d app_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg://app:app@localhost:5432/app_test
+      REQUIRE_DATABASE: "1" # database tests must run, never silently skip
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - run: uv sync --locked
+
+      - name: pytest with coverage gate
+        run: uv run pytest --cov --cov-report=term --cov-report=xml
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build, scan, smoke test
+    needs: [quality, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload Trivy SARIF to code scanning
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Image name
+        id: meta
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"   # GHCR requires lowercase
+          echo "image=ghcr.io/${owner}/${IMAGE_BASENAME}" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.image }}:${{ github.sha }}
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.created }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy scan (SARIF for code scanning)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.74.0
+          image-ref: ${{ steps.meta.outputs.image }}:${{ github.sha }}
+          format: sarif
+          output: trivy.sarif
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        if: always() && hashFiles('trivy.sarif') != ''
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-image
+
+      - name: Trivy gate (fail on fixable CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.74.0
+          image-ref: ${{ steps.meta.outputs.image }}:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          skip-setup-trivy: true
+
+      - name: Smoke test the full stack (API + worker + Postgres)
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}:${{ github.sha }}
+        run: |
+          docker network create observability
+          # CHAOS_ERROR_RATE is forced off here: fault injection is a
+          # deploy-time setting for demonstrating the agent's SLO rollback.
+          printf 'APP_IMAGE=%s\nAPP_VERSION=%s\nPOSTGRES_PASSWORD=%s\nCHAOS_ERROR_RATE=0\n' \
+            "$IMAGE" "$GITHUB_SHA" "$(openssl rand -hex 16)" > /tmp/ci.env
+          compose() {
+            docker compose -p smoke -f deploy/compose/compose.yaml \
+              --env-file deploy/compose/staging.env --env-file /tmp/ci.env "$@"
+          }
+          compose run --rm migrate
+          compose up -d --wait --wait-timeout 120 db api worker
+          scripts/smoke-test.sh http://localhost:8081 "$GITHUB_SHA"
+
+      - name: Stack logs on failure
+        if: failure()
+        run: docker compose -p smoke logs --no-color || true
+
+      - name: Save image for the publish job
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}:${{ github.sha }}
+        run: docker save "$IMAGE" | gzip -1 > image.tar.gz
+
+      # The publish job pushes these exact bytes: what was scanned and smoke
+      # tested is what gets signed and deployed, with no rebuild in between.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish, SBOM, sign, attest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write     # push to GHCR
+      id-token: write     # keyless Sigstore signing via GitHub OIDC
+      attestations: write # build provenance
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      ref: ${{ steps.push.outputs.ref }}
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image
+
+      - name: Load scanned image
+        run: gunzip -c image.tar.gz | docker load
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        id: push
+        run: |
+          docker push "$IMAGE:$GITHUB_SHA"
+          # Ask the registry (not the local daemon) which digest it now serves.
+          digest="$(docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA" --format '{{.Manifest.Digest}}')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "could not determine pushed digest"; exit 1; }
+          ref="$IMAGE@$digest"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pushed \`$ref\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          image: ${{ steps.push.outputs.ref }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: true
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      - name: Sign image and attach SBOM attestation (keyless)
+        env:
+          REF: ${{ steps.push.outputs.ref }}
+        run: |
+          cosign sign --yes "$REF"
+          cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$REF"
+
+      - name: SLSA build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  # ---------------------------------------------------------------------------
+  promote-staging:
+    name: Promote to staging
+    needs: publish
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: http://ai-lab:8081
+    permissions:
+      contents: write # commit to the environments branch
+    concurrency:
+      group: promote-staging
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Commit release to environments/staging
+        env:
+          IMAGE_REF: ${{ needs.publish.outputs.ref }}
+          VERSION: ${{ github.sha }}
+        run: scripts/promote.sh staging
+
+  # ---------------------------------------------------------------------------
+  promote-production:
+    name: Promote to production
+    needs: [promote-staging, publish]
+    runs-on: ubuntu-latest
+    # Configure required reviewers on the `production` environment in repo
+    # settings; this job then waits for manual approval before running.
+    environment:
+      name: production
+      url: http://ai-lab:8080
+    permissions:
+      contents: write
+    concurrency:
+      group: promote-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Commit staging's release to environments/production
+        env:
+          VERSION: ${{ github.sha }}
+        run: scripts/promote.sh production

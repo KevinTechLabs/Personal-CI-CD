@@ -1,0 +1,58 @@
+[project]
+name = "personal-ci-cd"
+version = "2.0.0"
+description = "FastAPI + Postgres + worker service used to demonstrate an end-to-end CI/CD and GitOps pipeline"
+requires-python = ">=3.14"
+# Runtime dependencies. After editing, run `uv lock` and commit uv.lock.
+# CI uses `uv sync --locked`, so a stale lockfile fails the build.
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "sqlalchemy>=2.0",
+    "alembic>=1.14",
+    "psycopg[binary]>=3.2",
+    "prometheus-client>=0.21",
+]
+
+[dependency-groups]
+# Test and lint tooling: installed in CI, never in the container image.
+dev = [
+    "pytest>=8",
+    "pytest-cov>=6",
+    "httpx>=0.28",
+    "ruff>=0.9",
+    "bandit[toml]>=1.8",
+    "pip-audit>=2.7",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["db: needs a PostgreSQL database (DATABASE_URL)"]
+addopts = "-ra --strict-markers"
+filterwarnings = ["error::DeprecationWarning:app.*"]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/healthcheck.py"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "SIM"]
+ignore = ["B008"]  # FastAPI's Depends() in defaults is idiomatic
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S311", "BLE001"]
+"migrations/**" = ["I001"]
+
+[tool.bandit]
+exclude_dirs = ["tests"]

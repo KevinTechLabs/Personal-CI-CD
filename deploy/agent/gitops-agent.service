@@ -1,0 +1,24 @@
+[Unit]
+Description=GitOps agent: reconcile Docker Compose environments from Git
+Documentation=https://github.com/KevinTechLabs/Personal-CI-CD/blob/main/docs/OPERATIONS.md
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=gitops
+Group=gitops
+SupplementaryGroups=docker
+Environment=GITOPS_AGENT_CONFIG=/etc/gitops-agent/agent.env
+ExecStart=/opt/gitops-agent/gitops-agent.sh
+# A deploy includes a soak window; allow plenty of time.
+TimeoutStartSec=15min
+
+# Hardening (the docker group is still root-equivalent; see docs).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/gitops-agent
+ReadOnlyPaths=/etc/gitops-agent

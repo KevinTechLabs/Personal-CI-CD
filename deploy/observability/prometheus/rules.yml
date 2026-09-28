@@ -1,0 +1,39 @@
+groups:
+  - name: slo
+    rules:
+      # Fraction of API requests answered with a 5xx over the last 2 minutes.
+      # The GitOps agent queries this during its post-deploy soak window and
+      # rolls back if it exceeds MAX_ERROR_RATIO.
+      - record: env:http_error_ratio:rate2m
+        expr: |
+          sum by (env) (rate(http_requests_total{job="api", status=~"5.."}[2m]))
+          /
+          sum by (env) (rate(http_requests_total{job="api"}[2m]))
+
+      - record: env:http_latency_p95_seconds:rate5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (env, le) (rate(http_request_duration_seconds_bucket{job="api"}[5m])))
+
+  - name: alerts
+    rules:
+      - alert: HighErrorRatio
+        expr: env:http_error_ratio:rate2m > 0.05
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.env }}: {{ $value | humanizePercentage }} of requests failing"
+
+      - alert: TargetDown
+        expr: up{job=~"api|worker"} == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.job }} in {{ $labels.env }} is not being scraped"
+
+      - alert: QueueBacklog
+        expr: worker_queue_depth > 100
+        for: 10m
+        labels: { severity: warn }
+        annotations:
+          summary: "{{ $labels.env }}: {{ $value }} tasks waiting; worker may be stuck"

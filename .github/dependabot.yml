@@ -1,0 +1,25 @@
+# Keeps every pinned thing current: Python lockfile, base images, GitHub
+# Actions (pinned by commit SHA; Dependabot updates the SHA and the comment).
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    groups:
+      python-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: weekly, day: monday }
+
+  - package-ecosystem: docker-compose
+    directories: [/deploy/compose, /deploy/observability]
+    schedule: { interval: weekly, day: monday }
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    groups:
+      actions:
+        patterns: ["*"]

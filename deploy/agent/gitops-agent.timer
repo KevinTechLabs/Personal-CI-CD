@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the GitOps agent every minute
+
+[Timer]
+OnBootSec=1min
+# Measured from the end of the previous run, so runs never overlap.
+OnUnitInactiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# Scenario tests for deploy/agent/gitops-agent.sh.
+#
+# docker, cosign and curl are replaced by small stubs that simulate a host:
+# the stubs track which release each environment is running, answer the
+# health endpoints, and report an error ratio from "Prometheus". This lets
+# CI exercise the agent's decisions (gating, rollback, drift healing)
+# without a real homelab.
+#
+#   tests/agent/run.sh
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+WORK="$(mktemp -d)"
+[[ -n "${KEEP_WORK:-}" ]] || trap 'rm -rf "$WORK"' EXIT
+
+MOCK="$WORK/mock"; BIN="$WORK/bin"; mkdir -p "$MOCK" "$BIN"
+export MOCK
+PASS=0
+
+# --------------------------------------------------------------------------- stubs
+cat > "$BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+# Minimal docker stub: records calls, tracks the running release per project.
+echo "docker $*" >> "$MOCK/calls.log"
+[[ "$1" == network ]] && exit 0
+[[ "$1" == compose ]] || exit 0
+shift
+project="" release=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --project-name) project="$2"; shift 2 ;;
+    --env-file) [[ "$2" == */release.env ]] && release="$2"; shift 2 ;;
+    --project-directory|--file) shift 2 ;;
+    *) break ;;
+  esac
+done
+version="$(sed -n 's/^APP_VERSION=//p' "$release")"
+case "$1" in
+  run)  [[ -f "$MOCK/fail-migrate-$version" ]] && exit 1; exit 0 ;;
+  up)   echo "$version" > "$MOCK/$project.running"; rm -f "$MOCK/$project.down"; exit 0 ;;
+  stop) rm -f "$MOCK/$project.running"; exit 0 ;;
+  ps)   [[ -f "$MOCK/$project.down" ]] || printf 'api\ndb\nworker\n'; exit 0 ;;
+  *)    exit 0 ;;
+esac
+EOF
+
+cat > "$BIN/cosign" <<'EOF'
+#!/usr/bin/env bash
+echo "cosign $*" >> "$MOCK/calls.log"
+image="${!#}"
+[[ -f "$MOCK/bad-signature" ]] && grep -qxF "$image" "$MOCK/bad-signature" && exit 1
+exit 0
+EOF
+
+cat > "$BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+# Answers /ready, /version and Prometheus queries from the stub state.
+url=""; for a in "$@"; do [[ "$a" == http* ]] && url="$a"; done
+case "$url" in
+  *:8081/*) project=cicd-staging ;;
+  *:8080/*) project=cicd-production ;;
+esac
+running="$(cat "$MOCK/$project.running" 2>/dev/null || true)"
+case "$url" in
+  */api/v1/query)
+    query="${*: -1}"; env="${query#*env=\"}"; env="${env%%\"*}"
+    running="$(cat "$MOCK/cicd-$env.running" 2>/dev/null || true)"
+    ratio=0.0; [[ -f "$MOCK/errors-$running" ]] && ratio=0.5
+    printf '{"status":"success","data":{"result":[{"value":[0,"%s"]}]}}' "$ratio" ;;
+  */ready)
+    [[ -n "$running" && ! -f "$MOCK/notready-$running" ]] || exit 22 ;;
+  */version)
+    [[ -n "$running" ]] || exit 22
+    printf '{"version":"%s"}' "$running" ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$BIN"/*
+
+# --------------------------------------------------------------------------- git remote
+REMOTE="$WORK/remote.git"
+git init -q --bare "$REMOTE"
+SRC="$WORK/src"
+git clone -q "$REMOTE" "$SRC" 2>/dev/null
+cp -r "$ROOT/deploy" "$ROOT/scripts" "$SRC/"
+git -C "$SRC" add -A
+git -C "$SRC" -c user.name=t -c user.email=t@t commit -qm init
+git -C "$SRC" push -q origin HEAD:main 2>/dev/null
+
+digest() { printf 'ghcr.io/test/app@sha256:%064d' "$1"; }
+promote() { # promote <env> <version> [digest-seed]
+  (cd "$SRC" && IMAGE_REF="$(digest "${3:-0}")" VERSION="$1" \
+    scripts/promote.sh "$2" >/dev/null 2>&1) || return 1
+}
+
+# --------------------------------------------------------------------------- agent config
+STATE="$WORK/state"; SECRETS="$WORK/secrets"; mkdir -p "$SECRETS"
+for e in staging production; do echo "POSTGRES_PASSWORD=x" > "$SECRETS/$e.env"; done
+cat > "$WORK/agent.env" <<EOF
+REPO_URL=$REMOTE
+STATE_DIR=$STATE
+SECRETS_DIR=$SECRETS
+READY_TIMEOUT=3
+SOAK_SECONDS=1
+SOAK_INTERVAL=0
+COSIGN_IDENTITY_REGEXP=test
+EOF
+
+agent() {
+  PATH="$BIN:$PATH" GITOPS_AGENT_CONFIG="$WORK/agent.env" \
+    "$ROOT/deploy/agent/gitops-agent.sh" >> "$WORK/agent.log" 2>&1 || true
+}
+running() { cat "$MOCK/cicd-$1.running" 2>/dev/null || echo none; }
+state()   { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["state"])' "$STATE/$1/status.json"; }
+
+check() { # check <description> <actual> <expected>
+  if [[ "$2" == "$3" ]]; then PASS=$((PASS + 1)); echo "ok   - $1"
+  else echo "FAIL - $1: got '$2', expected '$3'"; echo "--- agent log"; tail -30 "$WORK/agent.log"; exit 1; fi
+}
+
+# --------------------------------------------------------------------------- scenarios
+agent
+check "no environments branch yet: nothing deployed" "$(running staging)" none
+
+promote aaaaaaa1 staging 1
+agent
+check "first staging deploy" "$(running staging)" aaaaaaa1
+check "staging status is deployed" "$(state staging)" deployed
+
+promote aaaaaaa1 production
+agent
+check "production deploys a staging-verified digest" "$(running production)" aaaaaaa1
+
+touch "$MOCK/errors-bbbbbbb2"
+promote bbbbbbb2 staging 2
+agent
+check "SLO breach rolls staging back" "$(running staging)" aaaaaaa1
+check "staging status is rolled_back" "$(state staging)" rolled_back
+calls_before="$(wc -l < "$MOCK/calls.log")"
+agent
+check "known-bad revision is not retried" "$(wc -l < "$MOCK/calls.log" | awk -v b="$calls_before" '{print ($1 - b < 10) ? "skipped" : "retried"}')" skipped
+
+promote bbbbbbb2 production || true
+agent
+check "production refuses digest that failed staging" "$(running production)" aaaaaaa1
+check "production status is waiting" "$(state production)" waiting
+
+touch "$MOCK/fail-migrate-ccccccc3"
+promote ccccccc3 staging 3
+agent
+check "failed migration leaves previous release serving" "$(running staging)" aaaaaaa1
+check "staging status is failed" "$(state staging)" failed
+
+touch "$MOCK/notready-ddddddd4"
+promote ddddddd4 staging 4
+agent
+check "unready release rolls back" "$(running staging)" aaaaaaa1
+
+printf 'ghcr.io/test/app@sha256:%064d\n' 5 > "$MOCK/bad-signature"
+promote eeeeeee5 staging 5
+agent
+check "unsigned image is refused" "$(running staging)" aaaaaaa1
+check "refused status is failed" "$(state staging)" failed
+
+promote fffffff6 staging 6
+agent
+check "good release after failures deploys" "$(running staging)" fffffff6
+agent
+check "production keeps waiting on the unverified promotion" "$(state production)" waiting
+promote fffffff6 production
+agent
+check "production follows verified staging release" "$(running production)" fffffff6
+
+touch "$MOCK/cicd-staging.down"
+agent
+check "drift is healed" "$([[ -f "$MOCK/cicd-staging.down" ]] && echo down || echo up)" up
+
+echo "all $PASS agent scenario checks passed"

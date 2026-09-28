@@ -1,0 +1,16 @@
+# Local development overlay: builds the image from source and exposes the DB.
+#
+#   make dev        (see Makefile)
+#
+# Not used by CI or the GitOps agent.
+
+services:
+  db:
+    ports:
+      - "127.0.0.1:5432:5432"
+  migrate:
+    build: { context: ../.., args: { APP_VERSION: local } }
+  api:
+    build: { context: ../.., args: { APP_VERSION: local } }
+  worker:
+    build: { context: ../.., args: { APP_VERSION: local } }
