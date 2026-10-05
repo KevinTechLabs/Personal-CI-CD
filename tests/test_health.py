@@ -78,6 +78,15 @@ def test_heartbeat_is_throttled(db_session):
     assert hb.beat(db_session, force=True) is True
 
 
+def test_first_heartbeat_is_never_throttled_on_a_fresh_boot(db_session, monkeypatch):
+    # Regression: time.monotonic() is seconds since boot; a host up for less
+    # than the interval used to skip the first beat.
+    monkeypatch.setattr("app.worker.time.monotonic", lambda: 3.0)
+    hb = Heartbeat("test-sha", "test", interval=60)
+    assert hb.beat(db_session) is True
+    assert hb.beat(db_session) is False
+
+
 def test_heartbeat_upsert_tracks_processed_count(db_session):
     hb = _beat(db_session)
     hb.tasks_processed = 7

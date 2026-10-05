@@ -100,7 +100,10 @@ class Heartbeat:
         self.interval = interval
         self.started_at = datetime.now(UTC)
         self.tasks_processed = 0
-        self._last_beat = 0.0
+        # -inf, not 0: time.monotonic() counts from boot, so on a freshly
+        # booted host (CI runners, a rebooted server) it can be smaller than
+        # the interval, and a 0 here would silently skip the first heartbeat.
+        self._last_beat = float("-inf")
 
     def beat(self, session: Session, *, force: bool = False) -> bool:
         """Upsert this worker's row, at most once per interval. Returns True if written."""
