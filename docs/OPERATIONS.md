@@ -92,8 +92,9 @@ git clone https://github.com/KevinTechLabs/Personal-CI-CD.git ~/personal-ci-cd
 cd ~/personal-ci-cd
 sudo deploy/agent/install.sh          # user, dirs, secrets, systemd timer
 
-# Alerts -> Sentinel (see "Connect Sentinel" below first)
-sudo deploy/observability/configure-alerts.sh --sentinel http://<sentinel-ip>:8088
+# Alerts -> Sentinel (see "Connect Sentinel" below first). Sentinel runs on
+# this same machine (kevin-ai), so use localhost:
+sudo deploy/observability/configure-alerts.sh --sentinel http://127.0.0.1:8088
 
 # Monitoring stack
 cp deploy/observability/grafana.env.example deploy/observability/grafana.env
@@ -122,13 +123,25 @@ critical ones reach your Discord through Sentinel's existing webhook.
 3. After `docker compose up -d`, Sentinel starts receiving the Watchdog
    heartbeat from `ai-lab` within a minute (`/api/state` → `integrations`).
 
-**Dead man's switch.** If AI-LAB, Docker, Prometheus or Alertmanager dies,
-the heartbeat stops and Sentinel raises *Monitoring on ai-lab stopped
-reporting* (within ~4 minutes if Prometheus dies, 5 if the whole box does),
-then closes it when the heartbeat returns. This covers a dead AI-LAB only if
-Sentinel runs on a **different machine**. If they share a box, also add an
-off-site check (e.g. a free healthchecks.io check pinged by a second
-Alertmanager receiver) so a total outage still reaches you.
+**Dead man's switch, layer 1 (Sentinel).** If Prometheus or Alertmanager
+dies, the heartbeat stops and Sentinel raises *Monitoring on ai-lab stopped
+reporting* (within ~4–5 minutes), then closes it when the heartbeat returns.
+
+**Layer 2: something on another machine.** Sentinel lives on kevin-ai too,
+so if the whole box dies (power, kernel panic, network), Sentinel dies with it
+and nothing on kevin-ai can tell you. Watch it from another always-on machine
+that already posts to Discord:
+
+- **NexusLab hub** (if it runs on another machine): its agent on kevin-ai
+  already gives you *machine offline* alerts. With the agent in Docker
+  `monitor` mode it also reports stopped containers (Prometheus, Alertmanager,
+  the app stacks).
+- **Uptime Kuma** (on the mini PC): add an HTTP monitor for
+  `http://kevin-ai:8088/api/health`. That's Sentinel itself, the one service
+  whose failure would otherwise be silent.
+
+Between the two, every failure has a path to Discord that doesn't run on the
+machine that failed.
 
 Watch it work:
 

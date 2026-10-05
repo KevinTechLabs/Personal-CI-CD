@@ -3,6 +3,7 @@
 # (KevinTechLabs/Homelab-Soc-Dashboard, v1.7.0 or newer).
 #
 #   sudo deploy/observability/configure-alerts.sh --sentinel http://<sentinel-ip>:8088
+#   (Sentinel on this same machine: --sentinel http://127.0.0.1:8088)
 #
 # You'll be asked for Sentinel's *ingest key* (on the Sentinel server:
 # `sudo cat /etc/sentinel/ingest_token`). It can only push alerts in, so a copy
@@ -66,7 +67,11 @@ esac
 # 2. Alertmanager's copies. It runs as nobody (65534) inside its container.
 install -d -m 0755 "$secrets"
 umask 077
-printf '%s/api/ingest/alertmanager\n' "$sentinel" > "$secrets/sentinel_url"
+# Inside its container, 127.0.0.1 is Alertmanager itself; when Sentinel runs
+# on this host, reach it through the Docker host gateway instead.
+am_base="$(sed -E 's#^(https?://)(127\.0\.0\.1|localhost|\[::1\])#\1host.docker.internal#' <<<"$sentinel")"
+[[ "$am_base" != "$sentinel" ]] && echo "    Sentinel is on this host: Alertmanager will use $am_base"
+printf '%s/api/ingest/alertmanager\n' "$am_base" > "$secrets/sentinel_url"
 printf '%s\n' "$key" > "$secrets/sentinel_key"
 chown 65534:65534 "$secrets/sentinel_url" "$secrets/sentinel_key"
 chmod 0400 "$secrets/sentinel_url" "$secrets/sentinel_key"

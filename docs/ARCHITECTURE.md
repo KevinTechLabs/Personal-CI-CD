@@ -207,14 +207,19 @@ T1195.002 Compromise Software Supply Chain, critical. Inhibition rules keep
 one outage to one alert (e.g. `EndpointDown` suppresses that environment's
 symptom alerts).
 
-**Who watches the watcher?** Everything above runs on AI-LAB, so if AI-LAB
-dies, nothing on it can alert. The `Watchdog` alert is always firing and
-reaches Sentinel every minute as a heartbeat. If it stops (box down, Docker
-or Alertmanager dead) Sentinel raises *Monitoring on ai-lab stopped
-reporting* after 5 minutes; if Prometheus dies, Alertmanager sends the
-Watchdog as *resolved* once it expires (~4 minutes) and Sentinel raises it
-immediately. It closes itself when heartbeats resume. This was drilled
-end-to-end against real Prometheus and Alertmanager binaries. Every alert has a `promtool` unit test in
+**Who watches the watcher?** The `Watchdog` alert is always firing and
+reaches Sentinel every minute as a heartbeat. If it stops (Docker or
+Alertmanager dead) Sentinel raises *Monitoring on ai-lab stopped reporting*
+after 5 minutes; if Prometheus dies, Alertmanager sends the Watchdog as
+*resolved* once it expires (~4 minutes) and Sentinel raises it immediately.
+It closes itself when heartbeats resume. This was drilled end-to-end against
+real Prometheus and Alertmanager binaries.
+
+Sentinel runs on the same machine (kevin-ai), so a dead *machine* takes
+Sentinel down too. That last layer belongs off-box: NexusLab's
+machine-offline alert and an Uptime Kuma HTTP check of Sentinel's
+`/api/health`, both running on other hardware and posting to the same
+Discord. Each failure has a reporting path that doesn't share its fate. Every alert has a `promtool` unit test in
 `tests/monitoring/rules_test.yml`, so rule changes can't silently break
 alerting.
 

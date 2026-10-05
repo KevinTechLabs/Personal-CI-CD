@@ -59,6 +59,10 @@ services:
       # key. Never committed (see .gitignore).
       - ./secrets:/etc/alertmanager/secrets:ro
       - alertmanager-data:/alertmanager
+    # Lets Alertmanager reach Sentinel when it runs on this same host
+    # (configure-alerts.sh rewrites 127.0.0.1/localhost to this name).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "127.0.0.1:9093:9093"
     healthcheck:
