@@ -97,7 +97,7 @@ services:
 
   grafana:
     <<: *hardening
-    image: grafana/grafana:13.2.2
+    image: grafana/grafana:13.2.3
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?create grafana.env}
