@@ -1,19 +1,12 @@
-# Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
-
-# Virtual environment
 .venv/
-
-# Environment variables / secrets
-.env
-.env.*
-!.env.example
-
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+.envs/
+deploy/observability/grafana.env
+*.env.local
+image.tar.gz
+deploy/observability/secrets/

@@ -1,0 +1,103 @@
+# Application stack for one environment (staging or production).
+#
+# This file is promoted together with the image digest: CI copies it into
+# the `environments` branch, and the GitOps agent on AI-LAB applies exactly
+# what is committed there. Interpolated values come from three env files:
+#
+#   config.env   per-environment settings   (from deploy/compose/<env>.env)
+#   release.env  image digest + version     (written by the promotion job)
+#   secrets.env  database password          (on AI-LAB only, never in Git)
+
+x-app: &app
+  image: ${APP_IMAGE:?APP_IMAGE must be set to an image digest}
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  environment:
+    DATABASE_URL: postgresql+psycopg://app:${POSTGRES_PASSWORD:?set in secrets.env}@db:5432/app
+    ENVIRONMENT: ${ENVIRONMENT:?}
+    CHAOS_ERROR_RATE: ${CHAOS_ERROR_RATE:-0}
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in secrets.env}
+    volumes:
+      - db-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { memory: 512m }
+
+  # One-shot job. It sits in a profile so `up` never starts it; the GitOps
+  # agent runs it explicitly *before* replacing the app containers, so a
+  # failed migration leaves the previous release serving untouched.
+  migrate:
+    <<: *app
+    restart: "no"
+    profiles: [migrate]
+    command: ["alembic", "upgrade", "head"]
+    healthcheck:
+      disable: true
+    depends_on:
+      db: { condition: service_healthy }
+
+  api:
+    <<: *app
+    ports:
+      - "${HOST_PORT:?}:8000"
+    depends_on:
+      db: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 256m, cpus: "1.0" }
+    networks:
+      default: {}
+      observability:
+        aliases: ["api-${ENVIRONMENT}"]
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck", "--heartbeat", "/tmp/worker-heartbeat", "30"]
+      interval: 10s
+      timeout: 4s
+      start_period: 15s
+      retries: 3
+    depends_on:
+      db: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 256m, cpus: "0.5" }
+    networks:
+      default: {}
+      observability:
+        aliases: ["worker-${ENVIRONMENT}"]
+
+volumes:
+  db-data:
+
+networks:
+  # Shared with the observability stack so Prometheus can scrape both
+  # environments. Created by the GitOps agent (or CI) if missing.
+  observability:
+    external: true
+    name: observability

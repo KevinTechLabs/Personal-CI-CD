@@ -1,0 +1,49 @@
+# Unit tests for deploy/observability/prometheus/dora.yml (30-day windows,
+# so evaluated hourly to keep the test fast).
+#   promtool test rules tests/monitoring/dora_test.yml
+
+rule_files:
+  - ../../deploy/observability/prometheus/dora.yml
+
+evaluation_interval: 1h
+
+tests:
+  # --- DORA recording rules ------------------------------------------------------
+  - interval: 1d
+    input_series:
+      # Over 30 days: 30 deploys and 2 rollbacks; lead times sum to 30 * 1h;
+      # two recoveries taking 10 and 30 minutes.
+      - series: 'gitops_deploys_total{job="node",env="production"}'
+        values: '0+1x30'
+      - series: 'gitops_rollbacks_total{job="node",env="production"}'
+        values: '0x14 1x14 2x2'
+      - series: 'gitops_lead_time_seconds_sum{job="node",env="production"}'
+        values: '0+3600x30'
+      - series: 'gitops_lead_time_seconds_count{job="node",env="production"}'
+        values: '0+1x30'
+      - series: 'gitops_recovery_seconds_sum{job="node",env="production"}'
+        values: '0x14 600x14 2400x2'
+      - series: 'gitops_recovery_seconds_count{job="node",env="production"}'
+        values: '0x14 1x14 2x2'
+    promql_expr_test:
+      - expr: round(env:dora_deploys:increase7d)
+        eval_time: 30d
+        exp_samples:
+          - labels: '{job="node",env="production"}'
+            value: 7           # one deploy a day
+      - expr: round(env:dora_change_failure_rate:ratio30d, 0.0001)
+        eval_time: 30d
+        exp_samples:
+          - labels: '{job="node",env="production"}'
+            value: 0.0625      # 2 / (30 + 2)
+      - expr: round(env:dora_lead_time_seconds:avg30d)
+        eval_time: 30d
+        exp_samples:
+          - labels: '{job="node",env="production"}'
+            value: 3600
+      - expr: round(env:dora_time_to_restore_seconds:avg30d)
+        eval_time: 30d
+        exp_samples:
+          - labels: '{job="node",env="production"}'
+            value: 1200        # (600 + 1800) / 2
+

@@ -1,248 +1,328 @@
-# Operations Runbook
-
-This document records the operational steps used to run and maintain the Personal CI/CD Platform.
+# Operations runbook
 
 ## Hosts
 
-### REACTOR
+| Host | Role |
+|---|---|
+| **REACTOR** | development workstation; changes are pushed from here |
+| **AI-LAB** | runs staging (:8081), production (:8080), the GitOps agent, and the monitoring stack: Prometheus (localhost:9090), Alertmanager (localhost:9093), blackbox + node-exporter (internal), Grafana (:3000) |
 
-Development workstation. Source changes are made here and pushed to GitHub.
+---
 
-Repository:
+## One-time setup
 
-```text
-~/projects/my-cicd-project
-```
+### 1. Generate the lockfile (REACTOR)
 
-Normal developer flow:
-
-```bash
-git status
-git pull origin main
-# make changes
-git add .
-git commit -m "Describe the change"
-git push origin main
-```
-
-### AI-LAB
-
-Deployment host running the application container and the GitHub Actions self-hosted runner.
-
-Application deployment directory used during manual setup:
-
-```text
-/home/kevin-ai/my-cicd-project
-```
-
-Runner directory:
-
-```text
-~/actions-runner
-```
-
-The application is exposed on TCP port `8080`.
-
-## Self-hosted runner service
-
-The runner is named `kevin-ai` and uses the labels `self-hosted`, `Linux`, and `X64`.
-
-The runner was configured with GitHub's Linux runner package and then installed as a systemd service.
-
-### Check status
-
-On AI-LAB:
+CI installs with `uv sync --locked`, so `uv.lock` must exist before the first push.
 
 ```bash
-cd ~/actions-runner
-sudo ./svc.sh status
+curl -LsSf https://astral.sh/uv/install.sh | sh   # or: pipx install uv
+cd ~/projects/my-cicd-project
+git checkout v2-advanced-pipeline
+uv lock
+git add uv.lock && git commit -m "Add uv.lock" && git push
 ```
 
-A healthy service should show:
+Run `uv lock` again whenever you change dependencies in `pyproject.toml`.
 
-```text
-Loaded: loaded ...; enabled
-Active: active (running)
-```
+### 2. GitHub settings
 
-The runner should also appear as **Idle** in the repository's GitHub Settings → Actions → Runners page when it is not processing a job.
+**Settings → Environments**
 
-### Start/stop/restart
+- `staging`: no protection rules.
+- `production`: **Required reviewers** → add yourself. Under *Deployment
+  branches and tags*, allow `main` only. This is the manual approval gate.
+
+**Settings → Rules → Rulesets**
+
+- `main`: require status checks *Lint, SAST, dependency audit, secret scan*,
+  *Tests (Postgres integration)*, *Build, scan, smoke test* and *CodeQL*;
+  block force pushes. Working solo, you can still merge your own PRs.
+- `environments`: block force pushes and deletions. This keeps the
+  deployment history (your audit log) intact while still letting the
+  pipeline's bot commit.
+
+**Settings → Code security**: if CodeQL *default setup* is on, switch to
+*advanced*, since this repo ships its own `codeql.yml`. Enable Dependabot alerts.
+
+**Settings → Actions → General**: workflow permissions *read-only*. Every
+job declares what it needs.
+
+### 3. GHCR package visibility
+
+The organization's first publish creates `ghcr.io/kevintechlabs/my-cicd-project`.
+New packages start **private**, and AI-LAB pulls anonymously, so after the
+first green `main` run:
+
+*Your org → Packages → my-cicd-project → Package settings → Change visibility → Public.*
+
+(v1's package lived under the old owner `marcottejkevin-art`; it can be
+deleted once v2 is running.)
+
+### 4. AI-LAB: retire v1
+
+The self-hosted runner is no longer used. Remove it so nothing from this
+public repo can run jobs on the homelab:
 
 ```bash
 cd ~/actions-runner
-sudo ./svc.sh start
 sudo ./svc.sh stop
-sudo ./svc.sh status
+sudo ./svc.sh uninstall
+./config.sh remove --token <token from Settings → Actions → Runners → kevin-ai → Remove>
 ```
 
-If the service needs to be restarted:
+Leave the v1 container on :8080 running for now; it's removed in step 7.
+
+### 5. AI-LAB: install cosign
+
+The agent refuses unsigned images, so it needs cosign (same major version as CI):
 
 ```bash
-sudo ./svc.sh stop
-sudo ./svc.sh start
-sudo ./svc.sh status
+curl -fsSLO https://github.com/sigstore/cosign/releases/download/v3.1.3/cosign-linux-amd64
+curl -fsSLO https://github.com/sigstore/cosign/releases/download/v3.1.3/cosign_checksums.txt
+grep ' cosign-linux-amd64$' cosign_checksums.txt | sha256sum -c -
+sudo install -m 0755 cosign-linux-amd64 /usr/local/bin/cosign
+cosign version
 ```
 
-Do not run `./run.sh` interactively while the systemd service is already running. That would attempt to start a second runner process.
-
-### View systemd logs
-
-Use the service name displayed by `sudo ./svc.sh status` and inspect it with:
+### 6. AI-LAB: install the agent and observability stack
 
 ```bash
-sudo journalctl -u '<runner-service-name>' -f
+git clone https://github.com/KevinTechLabs/Personal-CI-CD.git ~/personal-ci-cd
+cd ~/personal-ci-cd
+sudo deploy/agent/install.sh          # user, dirs, secrets, systemd timer
+
+# Alerts -> Sentinel (see "Connect Sentinel" below first). Sentinel runs on
+# this same machine (kevin-ai), so use localhost:
+sudo deploy/observability/configure-alerts.sh --sentinel http://127.0.0.1:8088
+
+# Monitoring stack
+cp deploy/observability/grafana.env.example deploy/observability/grafana.env
+$EDITOR deploy/observability/grafana.env    # real password; GRAFANA_PORT if 3000 is taken
+cd deploy/observability && docker compose --env-file grafana.env up -d
 ```
 
-The runner should report that it is connected to GitHub and listening for jobs.
+The installer generates a Postgres password per environment in
+`/etc/gitops-agent/secrets/`.
 
-## Application container
+> **Port 3000:** if Open WebUI (NexusLLM) runs on AI-LAB, it already uses
+> 3000. Check with `ss -ltn | grep :3000` and set e.g. `GRAFANA_PORT=3030`.
 
-Container name:
+#### Connect Sentinel (your SOC dashboard)
 
-```text
-my-cicd-project
-```
+All alerts go to [Sentinel](https://github.com/KevinTechLabs/Homelab-Soc-Dashboard)
+(v1.7.0+): Prometheus alerts and deploy events land in its Alerts tab with
+acknowledge / escalate / close, close themselves when resolved, and high and
+critical ones reach your Discord through Sentinel's existing webhook.
 
-Port mapping:
+1. On the Sentinel server, update it (re-run its `sudo ./install-server.sh 8088`)
+   and print the **ingest key**: `sudo cat /etc/sentinel/ingest_token`.
+   This key can only push alerts in; it can't block addresses or touch pfSense.
+2. On AI-LAB, run `configure-alerts.sh` (above) and paste the key when asked.
+   It sends a test event first, so a wrong URL or key fails right there.
+3. After `docker compose up -d`, Sentinel starts receiving the Watchdog
+   heartbeat from `ai-lab` within a minute (`/api/state` → `integrations`).
 
-```text
-8080:8080
-```
+**Dead man's switch, layer 1 (Sentinel).** If Prometheus or Alertmanager
+dies, the heartbeat stops and Sentinel raises *Monitoring on ai-lab stopped
+reporting* (within ~4–5 minutes), then closes it when the heartbeat returns.
 
-Restart policy:
+**Layer 2: something on another machine.** Sentinel lives on kevin-ai too,
+so if the whole box dies (power, kernel panic, network), Sentinel dies with it
+and nothing on kevin-ai can tell you. Watch it from another always-on machine
+that already posts to Discord:
 
-```text
-unless-stopped
-```
+- **NexusLab hub** (if it runs on another machine): its agent on kevin-ai
+  already gives you *machine offline* alerts. With the agent in Docker
+  `monitor` mode it also reports stopped containers (Prometheus, Alertmanager,
+  the app stacks).
+- **Uptime Kuma** (on the mini PC): add an HTTP monitor for
+  `http://kevin-ai:8088/api/health`. That's Sentinel itself, the one service
+  whose failure would otherwise be silent.
 
-### Check container
+Between the two, every failure has a path to Discord that doesn't run on the
+machine that failed.
+
+Watch it work:
 
 ```bash
-docker ps
+journalctl -fu gitops-agent
 ```
 
-### Check application
+### 7. First production deploy
+
+1. Merge to `main`. Staging deploys automatically. Check http://ai-lab:8081
+   and the Grafana *Platform health* dashboard.
+2. Free port 8080: `docker rm -f my-cicd-project` (the v1 container).
+3. Approve the *Promote to production* job in the workflow run.
+4. Within a minute the agent deploys production on :8080.
+
+---
+
+## Day-to-day
+
+### Ship a change
 
 ```bash
-curl http://localhost:8080/
-curl http://localhost:8080/health
+git checkout -b my-change
+# edit, then:
+make lint && make test
+git push -u origin my-change     # open a PR: quality + tests + build/scan/smoke run
+# merge → staging deploys itself → approve production when happy
 ```
 
-Expected health response:
-
-```json
-{"status":"healthy"}
-```
-
-### View application logs
+### Where is each environment?
 
 ```bash
-docker logs my-cicd-project
+cat /var/lib/gitops-agent/staging/status.json
+cat /var/lib/gitops-agent/production/status.json
+curl -s localhost:8081/version; curl -s localhost:8080/version
+git log --oneline origin/environments      # full deployment history
 ```
 
-Follow logs live:
+`state` is one of `deployed`, `deploying`, `waiting` (production awaiting a
+staging-verified digest), `rolled_back`, `failed`, `degraded`.
+
+### Is everything healthy?
 
 ```bash
-docker logs -f my-cicd-project
+curl -s localhost:8081/ready | python3 -m json.tool   # per-dependency report
+curl -s localhost:9093/api/v2/alerts | python3 -c 'import json,sys; [print(a["labels"]["alertname"], a["labels"].get("env","")) for a in json.load(sys.stdin)]'
 ```
 
-## Automated deployment behavior
+Or open Grafana → *Personal CI/CD: Platform health*. The Watchdog alert is
+always listed (that's the dead man's switch working); anything else is real.
 
-The GitHub Actions deployment job runs only for a push to `main` and only after the test and Docker jobs succeed.
-
-The deployment runner:
-
-1. Pulls `ghcr.io/<owner>/my-cicd-project:<commit-sha>`.
-2. Stops `my-cicd-project` if it exists.
-3. Removes the old container if it exists.
-4. Starts the new image.
-5. Waits three seconds.
-6. Runs the `/health` endpoint with `curl --fail`.
-
-Because the image tag is the Git commit SHA, the deployed artifact can be traced to the source revision that produced it.
-
-## Manual recovery
-
-If an automated deployment leaves the application unavailable, first inspect the runner and container:
+### Silence an alert during maintenance
 
 ```bash
-cd ~/actions-runner
-sudo ./svc.sh status
-docker ps -a
-docker logs --tail 100 my-cicd-project
-curl --fail http://localhost:8080/health
+docker exec observability-alertmanager-1 amtool --alertmanager.url=http://localhost:9093 \
+  silence add alertname=EndpointDown env=staging --duration=1h --comment="planned work"
 ```
 
-If the current container must be stopped manually:
+### Database backups
+
+Production is backed up before every migration and once a day (configure in
+`agent.env`: `BACKUP_ENVIRONMENTS`, `BACKUP_KEEP`, `BACKUP_EVERY_HOURS`).
+Each dump is checked with `pg_restore --list` before it counts; if a
+pre-migration backup fails, the deploy waits and retries instead of migrating
+without one.
 
 ```bash
-docker stop my-cicd-project || true
-docker rm my-cicd-project || true
+sudo deploy/agent/restore-db.sh production                 # list backups
+sudo deploy/agent/restore-db.sh production <file.dump>     # restore one
 ```
 
-A previous known-good image can be pulled by its immutable Git SHA and started manually. Keep the exact SHA of the desired rollback image before replacing the current deployment.
+The restore script takes a safety backup first, pauses the agent, stops the
+api + worker, restores in a single transaction, starts them again and checks
+`/ready`. A dump's file name records the release that made it; if you
+restore to before a migration, also roll the release back (above).
 
-Example pattern:
+Off-box copies: backups live on AI-LAB's disk. For protection against losing
+the disk, sync `/var/lib/gitops-agent/backups` elsewhere (e.g. `rsync` over
+Tailscale to another machine, or `restic` to cloud storage) from a cron job.
+
+### Delivery metrics (DORA)
+
+Grafana → *Platform health* → **Delivery performance** shows the four DORA
+metrics per environment, colored by DORA performance tier: deployment
+frequency, lead time for changes, change failure rate (rollbacks count as
+failures) and time to restore. They're computed from the agent's own
+counters, so they start filling in after the first deploys.
+
+### Scheduled security scan
+
+Runs Monday and Thursday (and on demand: *Actions → Scheduled security scan →
+Run workflow*). If it finds a problem it opens one issue labeled
+`security-scan`, comments on each repeat, and closes it when a run passes.
+Usual fix: merge the Dependabot PR for the flagged package (or bump it
+yourself, `uv lock`, push) and let it flow through staging → production.
+
+### Roll back
+
+Rollback is a Git operation, like every other change:
 
 ```bash
-docker pull ghcr.io/marcottejkevin-art/my-cicd-project:<known-good-sha>
-
-docker run -d \
-  --name my-cicd-project \
-  --restart unless-stopped \
-  -p 8080:8080 \
-  ghcr.io/marcottejkevin-art/my-cicd-project:<known-good-sha>
-
-curl --fail http://localhost:8080/health
+git fetch origin environments
+git checkout environments
+git log --oneline -5                      # find the promotion to undo
+git revert <commit>
+git push origin environments
 ```
 
-## GHCR
+The agent applies the previous release within a minute. (The ruleset allows
+this: it blocks force pushes, not new commits.)
 
-The container image is published to GitHub Container Registry under:
+### Retry a revision the agent marked as failed
 
-```text
-ghcr.io/marcottejkevin-art/my-cicd-project
+If a failure was environmental (e.g. registry outage) rather than the release:
+
+```bash
+sudo rm /var/lib/gitops-agent/<env>/failed.rev
+sudo systemctl start gitops-agent
 ```
 
-The package is public, so AI-LAB can pull images without a personal access token.
+### Pause deployments
 
-The GitHub Actions workflow uses the built-in `GITHUB_TOKEN` for publishing rather than storing a registry password in the repository.
-
-Do not place GitHub tokens, passwords, or other credentials in this repository or in workflow output.
-
-## Trivy security gate
-
-The Docker image is scanned before it is published. The workflow checks `CRITICAL` and `HIGH` vulnerabilities and fails on findings that have a fix available.
-
-The runtime image was changed from Debian-based Python to Alpine after operating-system vulnerabilities were found during development. The final Docker build performs:
-
-```text
-apk upgrade --no-cache
+```bash
+sudo systemctl stop gitops-agent.timer     # running stacks are untouched
+sudo systemctl start gitops-agent.timer
 ```
 
-before the runtime image is published.
+### Demonstrate auto-rollback
 
-Python build tooling that is unnecessary at runtime is removed after dependency installation.
+Set `CHAOS_ERROR_RATE=0.5` in `deploy/compose/staging.env`, merge, and watch
+the journal and Grafana: the agent detects the SLO breach during its soak
+and rolls staging back. Set it back to `0` to recover. Health probes are
+exempt from injected faults, so this exercises the SLO path specifically.
 
-## Incident notes from initial setup
+### Add a database migration
 
-### GHCR authentication
+```bash
+uv run alembic revision -m "add priority to tasks"
+```
 
-A personal access token was initially attempted for pulling the image. Authentication failed, but the GHCR package was subsequently confirmed to be public and the image could be pulled anonymously. No PAT is needed for the current deployment.
+It runs before the new code starts, while the old release is serving, so
+**expand only**: add nullable columns and new tables. Remove old columns in a
+later release. See ARCHITECTURE.md §4.
 
-### Trivy findings from Python tooling
+---
 
-The initial scan detected HIGH findings associated with `msgpack` and `setuptools` through Python tooling/vendor metadata. Instead of weakening the security gate, the runtime image was changed so `pip` and `setuptools` are removed after dependencies are installed.
+## Troubleshooting
 
-### Runner startup
+| Symptom | Look at |
+|---|---|
+| Production stuck `waiting` | Staging hasn't passed that digest on AI-LAB. Check staging's status and journal. |
+| `signature verification failed` | `COSIGN_IDENTITY_REGEXP` in agent.env vs. the repo/workflow name; cosign version; AI-LAB's clock. |
+| Pull fails with `unauthorized` | GHCR package still private (setup step 3). |
+| `migration failed` | `docker compose -p cicd-<env> logs migrate`. The old release is still serving. |
+| Soak keeps rolling back | Grafana error-ratio panel; `docker compose -p cicd-<env> logs api`. |
+| Deploy rolled back: `no heartbeat from a <sha> worker` | The new worker isn't starting: `docker compose -p cicd-<env> logs worker`. |
+| `pre-migration backup failed (will retry)` | `docker compose -p cicd-production ps db`; `journalctl -u gitops-agent \| grep backup`. Nothing was migrated. |
+| `DatabaseBackupStale` / `DatabaseBackupFailing` | Same as above; a manual run: `sudo systemctl start gitops-agent`. |
+| `low disk space (will retry)` | `docker system df`; free space and the agent retries on its own. Lower `PRUNE_AFTER` if images pile up. |
+| `/ready` says `degraded` | Read which check: `worker` (worker down, see logs), `queue` (worker too slow or stuck), `database` (slow). Degraded still serves traffic. |
+| Alerts not reaching Sentinel | `docker compose -f deploy/observability/compose.yaml logs alertmanager` (401 = wrong key, connection refused = URL/firewall); rerun `sudo configure-alerts.sh --sentinel …`. |
+| Sentinel: "Monitoring on ai-lab stopped reporting" | Prometheus/Alertmanager down or AI-LAB unreachable: `docker compose -f deploy/observability/compose.yaml ps`; it closes itself once the heartbeat returns. |
+| Sentinel shows alerts but Discord is quiet | Only high/critical go to Discord (Sentinel → Respond → Discord notifications); `warn` alerts are medium, inbox only. |
+| `GitOpsAgentStale` | `systemctl status gitops-agent.timer`, `journalctl -u gitops-agent -n 50`. |
+| `GitOpsAgentMetricsMissing` | Agent installed before this release: rerun `sudo deploy/agent/install.sh` (creates the metrics dir), then restart node-exporter. |
+| `DeployDependencyUnreachable` | AI-LAB can't reach GHCR / GitHub / Sigstore: check DNS, internet, Tailscale exit-node settings. |
+| `HostClockSkew` | `timedatectl`; enable NTP (`sudo timedatectl set-ntp true`). Signature checks fail on a wrong clock. |
+| `Prometheus unavailable` warnings | `docker compose -f deploy/observability/compose.yaml ps`; soak falls back to readiness-only unless `REQUIRE_PROMETHEUS=true`. |
+| CI `uv lock --check` fails | Dependencies changed without re-locking: run `uv lock` and commit. |
+| Stack logs | `docker compose -p cicd-staging logs -f api worker` |
 
-The runner was first tested with `./run.sh`. That requires an interactive terminal and stops when the process is stopped. Installing the runner with `svc.sh` changed the deployment to a persistent systemd service that starts at boot.
+---
 
-## Public-repository runner warning
+## v1 history
 
-This repository uses a self-hosted runner while the repository is public. GitHub warns that self-hosted runners attached to public repositories carry additional risk because untrusted workflow code may execute on the runner.
+Lessons from v1 that shaped v2:
 
-The workflow limits deployment to pushes on `main`, while pull-request test/build jobs use GitHub-hosted runners. This reduces exposure but does not eliminate the underlying risk.
-
-For a hardened environment, consider making the repository private and protecting `main` with required reviews and status checks.
+- **GHCR auth**: a PAT was tried for pulls before confirming the package was
+  public. v2 keeps anonymous pulls (set the new package public, step 3).
+- **Trivy findings from tooling**: `msgpack`/`setuptools` HIGHs came from
+  pip's vendored metadata, not the app. Fixed by removing pip/setuptools from
+  the runtime image rather than weakening the gate. v2 keeps this.
+- **Self-hosted runner on a public repo**: flagged as a risk in v1; removed
+  entirely in v2 by switching to pull-based deploys.
