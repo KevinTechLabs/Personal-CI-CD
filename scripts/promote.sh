@@ -66,11 +66,14 @@ write_staging() {
   mkdir -p "$dir"
   cp "$SRC_DIR/deploy/compose/compose.yaml" "$dir/compose.yaml"
   cp "$SRC_DIR/deploy/compose/staging.env"  "$dir/config.env"
+  local committed
+  committed="$(git -C "$SRC_DIR" log -1 --format=%ct "$VERSION" 2>/dev/null || true)"
   cat > "$dir/release.env" <<EOF
 # Written by scripts/promote.sh; do not edit by hand (revert the commit instead).
 APP_IMAGE=$image_ref
 APP_VERSION=$VERSION
 PROMOTED_FROM=$RUN_URL
+COMMIT_TIMESTAMP=${committed:-0}
 EOF
 }
 

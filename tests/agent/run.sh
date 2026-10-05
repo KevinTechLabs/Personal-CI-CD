@@ -43,6 +43,16 @@ case "$1" in
   up)   echo "$version" > "$MOCK/$project.running"; rm -f "$MOCK/$project.down"; exit 0 ;;
   stop) rm -f "$MOCK/$project.running"; exit 0 ;;
   ps)   [[ -f "$MOCK/$project.down" ]] || printf 'api\ndb\nworker\n'; exit 0 ;;
+  exec) # exec -T db <cmd...>: fake pg_dump / pg_restore --list
+    shift; [[ "$1" == -T ]] && shift; shift
+    case "$1" in
+      pg_dump)
+        [[ -f "$MOCK/fail-backup" ]] && exit 1
+        if [[ -f "$MOCK/corrupt-backup" ]]; then echo "garbage"; else echo "PGDMP fake dump of $version"; fi ;;
+      pg_restore)
+        head -c5 | grep -q PGDMP && echo "1; 2615 2200 SCHEMA - public app" ;;
+    esac
+    exit 0 ;;
   *)    exit 0 ;;
 esac
 EOF
@@ -59,6 +69,15 @@ cat > "$BIN/curl" <<'EOF'
 #!/usr/bin/env bash
 # Answers /ready, /version and Prometheus queries from the stub state.
 url=""; for a in "$@"; do [[ "$a" == http* ]] && url="$a"; done
+if [[ "$url" == http://sentinel.test/* ]]; then   # record what the agent sends to Sentinel
+  echo "$*" >> "$MOCK/sentinel-args.log"
+  prev=""; for a in "$@"; do
+    [[ "$prev" == -d ]] && echo "$a" >> "$MOCK/sentinel.jsonl"
+    if [[ "$prev" == -H && "$a" == @* ]]; then cat "${a#@}" >> "$MOCK/sentinel-headers.log"; fi
+    prev="$a"
+  done
+  exit 0
+fi
 case "$url" in
   *:8081/*) project=cicd-staging ;;
   *:8080/*) project=cicd-production ;;
@@ -114,7 +133,11 @@ READY_TIMEOUT=3
 SOAK_SECONDS=1
 SOAK_INTERVAL=0
 COSIGN_IDENTITY_REGEXP=test
+SENTINEL_URL=http://sentinel.test
+BACKUP_KEEP=3
+SENTINEL_KEY_FILE=$WORK/sentinel_key
 EOF
+echo "s3cret-ingest-key-abcdef" > "$WORK/sentinel_key"
 
 agent() {
   PATH="$BIN:$PATH" GITOPS_AGENT_CONFIG="$WORK/agent.env" \
@@ -225,5 +248,74 @@ check "metrics: staging deploys counted" "$(metric 'gitops_deploys_total{env="st
 check "metrics: drift heal counted" "$(metric 'gitops_drift_heals_total{env="staging"}')" 1.0
 check "metrics: production version exported" "$(grep -c 'gitops_environment_info{env="production",version="fffffff6"' "$STATE/metrics/gitops.prom")" 1
 check "metrics file is world-readable for node-exporter" "$(stat -c %a "$STATE/metrics/gitops.prom")" 644
+
+# --- events sent to Sentinel ---------------------------------------------------
+sentinel() { # sentinel <python expr over list E of events>
+  python3 -c 'import json,sys; E=[json.loads(l) for l in open(sys.argv[1])]; print(eval(sys.argv[2]))' \
+    "$MOCK/sentinel.jsonl" "$1"
+}
+check "Sentinel: each deploy reported as info" \
+  "$(sentinel 'sum(1 for e in E if e["level"]=="info" and " deployed " in e["title"])')" 5
+check "Sentinel: each rollback raised as high alert" \
+  "$(sentinel 'sorted(e.get("key","").split(":")[1] for e in E if e["level"]=="high" and e.get("key","").startswith("rollback:"))')" \
+  "['staging', 'staging', 'staging', 'staging']"
+check "Sentinel: unsigned image raised as critical supply-chain alert" \
+  "$(sentinel '[(e["level"], e["technique"], e["tactic"]) for e in E if e.get("key","").startswith("refused:")]')" \
+  "[('critical', 'T1195.002', 'Initial Access')]"
+check "Sentinel: failed migration reported" "$(sentinel 'sum(1 for e in E if e.get("key","").startswith("migration:"))')" 1
+check "Sentinel: low disk reported" "$(sentinel 'sum(1 for e in E if e.get("key","").startswith("disk:"))')" 1
+check "Sentinel: every event tagged with source and kind" \
+  "$(sentinel 'all(e["source"]=="ai-lab" and e["kind"]=="GitOps" for e in E)')" True
+check "Sentinel key sent as a header" \
+  "$(grep -c 'Authorization: Bearer s3cret-ingest-key-abcdef' "$MOCK/sentinel-headers.log")" \
+  "$(wc -l < "$MOCK/sentinel.jsonl")"
+check "Sentinel key never on the command line" "$(grep -c 's3cret' "$MOCK/sentinel-args.log" || true)" 0
+
+# --- database backups -----------------------------------------------------------
+backups() { find "$STATE/backups/$1" -name '*.dump' -printf '%f\n' 2>/dev/null | sort; }
+check "staging is not backed up by default" "$(backups staging | wc -l)" 0
+check "first production deploy got a daily backup" "$(backups production | grep -c -- '-daily-' || true)" 1
+check "production deploy over a live DB took a pre-migration backup" \
+  "$(backups production | grep -c -- '-pre-fffffff6-' || true)" 1
+check "backup files are private" "$(find "$STATE/backups/production" -name '*.dump' -perm 600 | wc -l)" "$(backups production | wc -l)"
+
+promote d0d0d0d0 staging 10
+agent
+touch "$MOCK/fail-backup"
+promote d0d0d0d0 production
+agent
+check "failed backup blocks the production migration" "$(running production)" fffffff6
+check "blocked deploy status says it will retry" \
+  "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["detail"])' "$STATE/production/status.json")" \
+  "pre-migration backup failed (will retry)"
+check "Sentinel told about the blocked deploy" \
+  "$(sentinel 'sum(1 for e in E if e.get("key","")=="backup:production:d0d0d0d0")')" 1
+rm -f "$MOCK/fail-backup"; touch "$MOCK/corrupt-backup"
+agent
+check "unverifiable backup also blocks it" "$(running production)" fffffff6
+check "no corrupt dump left behind" "$(find "$STATE/backups/production" -name '*.partial' | wc -l)" 0
+rm -f "$MOCK/corrupt-backup"
+agent
+check "deploy proceeds once a verified backup succeeds" "$(running production)" d0d0d0d0
+check "retention keeps at most BACKUP_KEEP dumps" "$(( $(backups production | wc -l) <= 3 ))" 1
+check "metrics: backup failures counted" "$(metric 'gitops_backup_failures_total{env="production"}')" 2.0
+check "metrics: last backup timestamp exported" \
+  "$(python3 -c 'import sys,time; print(abs(time.time()-float(sys.argv[1])) < 600)' "$(metric 'gitops_backup_last_timestamp_seconds{env="production"}')")" True
+
+# --- DORA ---------------------------------------------------------------------
+check "DORA: two staging incidents recovered" "$(metric 'gitops_recovery_seconds_count{env="staging"}')" 2.0
+check "DORA: no production incidents" "$(metric 'gitops_recovery_seconds_count{env="production"}')" 0.0
+check "DORA: no incident left open" "$(metric 'gitops_incident_open_since_timestamp_seconds{env="staging"}')" 0.0
+# A release built from a real commit records lead time (commit -> running).
+hour_ago="@$(( $(date +%s) - 3600 ))"
+GIT_COMMITTER_DATE="$hour_ago" git -C "$SRC" -c user.name=t -c user.email=t@t \
+  commit -q --allow-empty -m "feature" --date="$hour_ago"
+real="$(git -C "$SRC" rev-parse HEAD)"
+promote "$real" staging 11
+check "release.env carries the commit time" "$(git --git-dir="$REMOTE" show environments:staging/release.env | grep -c '^COMMIT_TIMESTAMP=[1-9]')" 1
+agent
+check "DORA: lead time recorded for the real commit" "$(metric 'gitops_lead_time_seconds_count{env="staging"}')" 1.0
+check "DORA: lead time is commit-to-running (~1h)" \
+  "$(python3 -c 'import sys; print(3590 <= float(sys.argv[1]) < 3700)' "$(metric 'gitops_lead_time_seconds_sum{env="staging"}')")" True
 
 echo "all $PASS agent scenario checks passed"

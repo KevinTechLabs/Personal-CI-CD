@@ -31,7 +31,8 @@ GitOps deployment, and SLO-driven automatic rollback.
                                        ├─ production digest must have passed staging here
                                        ├─ cosign verify signature + SBOM attestation
                                        ├─ migrations first, old release keeps serving
-                                       ├─ disk preflight, then migrations first (old release keeps serving)
+                                       ├─ disk preflight, verified DB backup, then migrations
+                                       │    (old release keeps serving)
                                        ├─ replace api/worker ─▶ wait for /ready + API version
                                        │    + a heartbeat from a worker running the NEW version
                                        ├─ soak: synthetic traffic, worker heartbeat, error-ratio SLO
@@ -42,7 +43,7 @@ GitOps deployment, and SLO-driven automatic rollback.
                                         ╲                        ╱
                      Prometheus · Alertmanager · blackbox probes · node-exporter · Grafana :3000
                                                    │
-                         ntfy push to your phone ◀─┴─▶ healthchecks.io dead man's switch
+        Sentinel (SOC dashboard): one alert inbox + Discord + dead man's switch ◀─┘
 
  Scheduled (Mon/Thu): re-scan the DEPLOYED digests + lockfile ─▶ GitHub issue opens/closes itself
 ```
@@ -60,7 +61,9 @@ GitOps deployment, and SLO-driven automatic rollback.
 | **Promotion** | Staging updates automatically on every green `main`. Production waits for a required reviewer, then receives *the exact digest and compose file staging is running*. The script refuses if staging has moved on. |
 | **GitOps** | Desired state lives in Git (`environments` branch). A small agent on AI-LAB reconciles it: no inbound access, no GitHub credentials on the host, no self-hosted runner. Rolling back = `git revert`. |
 | **Safety** | Signature verification before deploy; production only accepts digests that passed staging on the same host; disk-space preflight; migrations before cutover; the new release must answer with its version **and** have a live worker on that version; SLO + heartbeat soak with automatic rollback; bad revisions are not retried; drift self-healing; old images pruned. |
-| **Alerting** | 18 alerts (plus SLO recording rules), every one covered by a `promtool` unit test in CI. Alertmanager pushes to your phone via ntfy (priority by severity, resolved notices, inhibition so one outage = one page). An always-firing Watchdog pings healthchecks.io every minute, so you're told even when AI-LAB itself is down. |
+| **Alerting** | 20 alerts (plus SLO and DORA recording rules), every one covered by a `promtool` unit test in CI. Alerts and deploy events go to **Sentinel**, the lab's SOC dashboard: one inbox with acknowledge / escalate / close, ATT&CK mapping, auto-close on resolve, and Discord for high/critical. Sentinel also acts as the dead man's switch: if AI-LAB's monitoring stops sending its heartbeat, Sentinel raises it. Uses an ingest-only key that can't touch the firewall. |
+| **Backups** | A verified `pg_dump` of production before **every migration** (no backup, no migration) and daily, 14 kept. Each dump must pass `pg_restore --list` before it counts. `deploy/agent/restore-db.sh` restores in one transaction after taking a safety backup. Alerts if backups go stale or fail. |
+| **DORA metrics** | Deployment frequency, lead time for changes (commit → running), change failure rate and time to restore, measured by the GitOps agent and shown on Grafana with DORA performance-tier colors. |
 | **Observability** | Two provisioned Grafana dashboards. *Service overview*: request rate, error ratio vs. rollback SLO, p95 latency, queue, deployed version with deploy annotations. *Platform health*: probe status, every dependency check, external dependencies, GitOps agent state/rollbacks, host disk/memory/CPU/clock. |
 
 ## Repository layout
@@ -73,7 +76,7 @@ tests/                  pytest suite; tests/agent/ = GitOps agent scenarios;
 Dockerfile              one image for api / worker / migrate
 pyproject.toml, uv.lock dependencies (locked, hashed)
 deploy/compose/         per-environment Compose stack + settings (promoted)
-deploy/agent/           GitOps agent, systemd units, installer
+deploy/agent/           GitOps agent, systemd units, installer, restore-db.sh
 deploy/observability/   Prometheus, Alertmanager, blackbox, node-exporter, Grafana
 scripts/promote.sh      commits a release to the environments branch
 scripts/smoke-test.sh   end-to-end check used by CI and by hand
@@ -103,8 +106,8 @@ make dev-down
    Prometheus and rolls staging back. It won't retry that revision.
 4. Production's approval job would be pointless: the agent refuses any
    digest that didn't pass staging.
-5. Your phone gets a "ROLLED BACK" push from the agent, and Grafana's
-   Platform health dashboard shows the rollback.
+5. Sentinel gets a high "staging rolled back" alert (and Discord a
+   message), and Grafana's Platform health dashboard shows the rollback.
 6. Set it back to `0` and push to recover.
 
 Follow along with `journalctl -fu gitops-agent` and the Grafana dashboards.
@@ -127,8 +130,8 @@ curl -s localhost:8081/ready | python3 -m json.tool
 }
 ```
 Stop the worker (`docker compose -p cicd-staging stop worker`) and `worker`
-turns `degraded` immediately, the API keeps serving, and after a minute your
-phone gets `WorkerHeartbeatStale`.
+turns `degraded` immediately, the API keeps serving, and a few minutes later
+`WorkerHeartbeatStale (staging)` appears in Sentinel and Discord.
 
 ## Getting started
 

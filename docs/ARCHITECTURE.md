@@ -123,6 +123,7 @@ fetch environments ─▶ tree hash changed?
            pipeline.yml on refs/heads/main)
         ─▶ disk preflight (MIN_FREE_DISK_MB); retried later, not marked bad
         ─▶ pull images
+        ─▶ production: verified pg_dump of the live DB (no backup, no migration)
         ─▶ run migrations while the OLD release keeps serving
              fail ─▶ stop; nothing was replaced
         ─▶ replace api + worker
@@ -186,15 +187,34 @@ drifting clock makes perfectly valid images fail verification.
 environment, deploys, rollbacks, drift heals), which node-exporter's textfile
 collector serves. If the timer dies, `GitOpsAgentStale` fires.
 
-**Who watches the watcher?** Everything above runs on AI-LAB, so if AI-LAB
-loses power, nothing on it can alert. The `Watchdog` alert is always firing;
-Alertmanager forwards it to healthchecks.io every minute. When the pings
-stop, healthchecks.io (off-site) notifies you. That's the dead man's switch.
+**One inbox: Sentinel.** Alertmanager delivers every alert, and its
+resolution, to [Sentinel](https://github.com/KevinTechLabs/Homelab-Soc-Dashboard),
+the lab's SOC dashboard, through its ingest API using an ingest-only key. The
+GitOps agent sends deploy events there too. Operational and security alerts
+share one triage flow (acknowledge / escalate / close), one ATT&CK view and
+one Discord channel:
 
-**Routing.** Alertmanager sends `page` alerts to ntfy at max priority and
-`warn` at normal priority, with resolved notices. Inhibition rules keep one
-outage to one notification (e.g. `EndpointDown` suppresses that
-environment's symptom alerts). Every alert has a `promtool` unit test in
+| Prometheus `severity` | Sentinel | Discord |
+|---|---|---|
+| `page` | high | yes |
+| `warn` | medium | no (inbox) |
+
+Rules carry `mitre_technique` / `mitre_tactic` labels using the techniques
+Sentinel's own detections use for the same symptoms (T1489 Service Stop for
+a down service, T1499 Endpoint DoS for exhaustion, T1562.006 Indicator
+Blocking for monitoring going dark). A refused unsigned image is reported as
+T1195.002 Compromise Software Supply Chain, critical. Inhibition rules keep
+one outage to one alert (e.g. `EndpointDown` suppresses that environment's
+symptom alerts).
+
+**Who watches the watcher?** Everything above runs on AI-LAB, so if AI-LAB
+dies, nothing on it can alert. The `Watchdog` alert is always firing and
+reaches Sentinel every minute as a heartbeat. If it stops (box down, Docker
+or Alertmanager dead) Sentinel raises *Monitoring on ai-lab stopped
+reporting* after 5 minutes; if Prometheus dies, Alertmanager sends the
+Watchdog as *resolved* once it expires (~4 minutes) and Sentinel raises it
+immediately. It closes itself when heartbeats resume. This was drilled
+end-to-end against real Prometheus and Alertmanager binaries. Every alert has a `promtool` unit test in
 `tests/monitoring/rules_test.yml`, so rule changes can't silently break
 alerting.
 
@@ -208,7 +228,30 @@ Other details:
   to keep label cardinality bounded. Probe and scrape endpoints are excluded
   so they don't dilute the SLO.
 
-## 6. Continuous dependency checking
+## 6. Backups and delivery metrics
+
+**Backups are part of the deploy.** For environments in
+`BACKUP_ENVIRONMENTS` (production by default) the agent runs `pg_dump
+--format=custom` inside the database container right before migrations, and
+again whenever the newest dump is older than a day. A dump only counts once
+`pg_restore --list` can read it; otherwise it's deleted, the failure is
+counted, and a pre-migration failure blocks the deploy (it retries next run).
+Dumps are `0600` in a `0700` directory, the newest 14 are kept, and
+`restore-db.sh` restores one in a single transaction after taking a safety
+backup. The backup/verify/restore commands were tested against a real
+PostgreSQL: delete all rows and drop a table, restore, and everything is
+back at the same schema revision.
+
+**DORA metrics come from the agent, not from CI.** CI knows when it
+*promoted* something; only the agent knows when it actually *ran*
+successfully. `promote.sh` records the commit time in `release.env`; on each
+successful deploy the agent adds commit→running time to a running sum
+(exported as a Prometheus summary). A rollback opens an incident and the
+next successful deploy closes it, which gives time to restore. Prometheus
+turns these into the four DORA metrics (`prometheus/dora.yml`, unit tested
+separately because of its 30-day windows).
+
+## 7. Continuous dependency checking
 
 Build-time scans only describe the day an image was built. The
 `security-scan` workflow (Mon/Thu) reads the digests actually deployed from
@@ -222,7 +265,7 @@ bumps the dependency → pipeline → staging → approve.
 
 OpenSSF Scorecard grades the repository's own supply-chain hygiene weekly.
 
-## 7. Security model and trade-offs
+## 8. Security model and trade-offs
 
 - **The docker group is root-equivalent.** The agent runs as a dedicated
   `gitops` user in that group under a hardened systemd unit. That's the

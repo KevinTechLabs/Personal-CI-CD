@@ -1,0 +1,32 @@
+# DORA delivery metrics, computed from the GitOps agent's metrics
+# (dashboard: Platform health -> Delivery performance).
+# Unit tested by tests/monitoring/dora_test.yml.
+#
+#   deployment frequency   successful deploys per 7 days
+#   lead time for changes  commit -> running in the environment (30-day mean)
+#   change failure rate    rollbacks / (deploys + rollbacks), 30 days
+#   time to restore        failed change -> next good deploy (30-day mean)
+
+groups:
+  - name: dora
+    interval: 5m
+    rules:
+      - record: env:dora_deploys:increase7d
+        expr: increase(gitops_deploys_total[7d])
+
+      - record: env:dora_lead_time_seconds:avg30d
+        expr: |
+          increase(gitops_lead_time_seconds_sum[30d])
+            / increase(gitops_lead_time_seconds_count[30d]) > 0
+
+      # Failed changes / all changes. A rollback is a failed change.
+      - record: env:dora_change_failure_rate:ratio30d
+        expr: |
+          increase(gitops_rollbacks_total[30d])
+            / (increase(gitops_deploys_total[30d]) + increase(gitops_rollbacks_total[30d])) >= 0
+
+      - record: env:dora_time_to_restore_seconds:avg30d
+        expr: |
+          increase(gitops_recovery_seconds_sum[30d])
+            / increase(gitops_recovery_seconds_count[30d]) > 0
+

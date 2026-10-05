@@ -6,6 +6,7 @@ global:
 
 rule_files:
   - rules.yml
+  - dora.yml
 
 alerting:
   alertmanagers:

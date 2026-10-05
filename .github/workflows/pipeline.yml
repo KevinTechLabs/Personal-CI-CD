@@ -74,7 +74,7 @@ jobs:
           img() { grep -oE "$1:v[0-9.]+" deploy/observability/compose.yaml | head -1; }
           run() { docker run --rm -v "$PWD:/w" -w /w "$@"; }
           run --entrypoint promtool "$(img prom/prometheus)" check config deploy/observability/prometheus/prometheus.yml
-          run --entrypoint promtool "$(img prom/prometheus)" test rules tests/monitoring/rules_test.yml
+          run --entrypoint promtool "$(img prom/prometheus)" test rules tests/monitoring/rules_test.yml tests/monitoring/dora_test.yml
           run --entrypoint amtool "$(img prom/alertmanager)" check-config deploy/observability/alertmanager/alertmanager.yml
           run "$(img prom/blackbox-exporter)" --config.check --config.file=deploy/observability/blackbox/blackbox.yml
           for f in deploy/observability/grafana/dashboards/*.json; do python3 -m json.tool "$f" >/dev/null; done

@@ -1,40 +1,41 @@
-# Alert routing.
+# Alert routing: everything goes to Sentinel (KevinTechLabs/Homelab-Soc-Dashboard).
 #
-#   Watchdog       -> healthchecks.io every minute (dead man's switch: if the
-#                     pings stop because AI-LAB, Docker, Prometheus or
-#                     Alertmanager died, healthchecks.io alerts you instead)
-#   everything else -> ntfy push notification, priority by severity
+# Sentinel files each alert in its inbox (acknowledge / escalate / close),
+# closes it when Alertmanager reports it resolved, and posts high and critical
+# ones to Discord. The always-firing Watchdog alert is Sentinel's heartbeat
+# from this host: if it stops arriving for 5 minutes, Sentinel raises
+# "Monitoring on ai-lab stopped reporting". That's the dead man's switch.
 #
-# The two URLs are read from files written by configure-alerts.sh so your
-# ntfy topic and ping URL never land in Git.
+# The Sentinel URL and its ingest-only key are read from files written by
+# configure-alerts.sh, so neither your LAN address nor the key lands in Git.
 
 route:
-  receiver: ntfy
+  receiver: sentinel
   group_by: [alertname, env]
   group_wait: 30s
   group_interval: 5m
   repeat_interval: 4h
   routes:
     - matchers: [alertname = "Watchdog"]
-      receiver: deadmans-switch
+      receiver: sentinel
       group_wait: 0s
       group_interval: 1m
       repeat_interval: 1m
 
 receivers:
-  - name: ntfy
+  - name: sentinel
     webhook_configs:
-      - url_file: /etc/alertmanager/secrets/ntfy_url
+      - url_file: /etc/alertmanager/secrets/sentinel_url
         send_resolved: true
-        max_alerts: 10
-
-  - name: deadmans-switch
-    webhook_configs:
-      - url_file: /etc/alertmanager/secrets/healthchecks_url
-        send_resolved: false
+        max_alerts: 50
+        timeout: 10s
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: /etc/alertmanager/secrets/sentinel_key
 
 inhibit_rules:
-  # If an environment's API is down, don't also page about its symptoms.
+  # If an environment's API is down, don't also report its symptoms.
   - source_matchers: [alertname = "EndpointDown"]
     target_matchers: [alertname =~ "HighErrorRatio|ReadinessDegraded|WorkerHeartbeatStale|QueueBacklog|SlowReadinessProbe"]
     equal: [env]

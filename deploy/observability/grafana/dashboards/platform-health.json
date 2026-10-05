@@ -2,7 +2,7 @@
   "uid": "platform-health",
   "title": "Personal CI/CD: Platform Health",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "30s",
   "tags": [
     "cicd",
@@ -1394,6 +1394,452 @@
               "mode": "off"
             }
           }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 56,
+      "type": "row",
+      "title": "Delivery performance (DORA, colored by DORA performance tier)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 65,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 57,
+      "type": "stat",
+      "title": "Deploys (7 days)",
+      "description": "Deployment frequency. Elite: on demand (several a week or more).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 66,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "env:dora_deploys:increase7d",
+          "legendFormat": "{{env}}",
+          "instant": true
+        }
+      ],
+      "options": {
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "orange",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "green",
+                "value": 7
+              }
+            ]
+          },
+          "noValue": "no data yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 58,
+      "type": "stat",
+      "title": "Lead time for changes (30d avg)",
+      "description": "Commit to running in the environment. Elite: under a day.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 66,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "env:dora_lead_time_seconds:avg30d",
+          "legendFormat": "{{env}}",
+          "instant": true
+        }
+      ],
+      "options": {
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 86400
+              },
+              {
+                "color": "orange",
+                "value": 604800
+              },
+              {
+                "color": "red",
+                "value": 2592000
+              }
+            ]
+          },
+          "noValue": "no data yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 59,
+      "type": "stat",
+      "title": "Change failure rate (30d)",
+      "description": "Share of changes that were rolled back. Elite: 0-15%.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 66,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "env:dora_change_failure_rate:ratio30d",
+          "legendFormat": "{{env}}",
+          "instant": true
+        }
+      ],
+      "options": {
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.15
+              },
+              {
+                "color": "orange",
+                "value": 0.3
+              },
+              {
+                "color": "red",
+                "value": 0.45
+              }
+            ]
+          },
+          "noValue": "no data yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 60,
+      "type": "stat",
+      "title": "Time to restore (30d avg)",
+      "description": "From a failed change to the next good deploy. Elite: under an hour.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 66,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "env:dora_time_to_restore_seconds:avg30d",
+          "legendFormat": "{{env}}",
+          "instant": true
+        }
+      ],
+      "options": {
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 3600
+              },
+              {
+                "color": "orange",
+                "value": 86400
+              },
+              {
+                "color": "red",
+                "value": 604800
+              }
+            ]
+          },
+          "noValue": "no data yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 61,
+      "type": "row",
+      "title": "Database backups",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 70,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 62,
+      "type": "stat",
+      "title": "Last verified backup",
+      "description": "Taken before every production migration and daily. Restore: deploy/agent/restore-db.sh",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 71,
+        "w": 8,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - gitops_backup_last_timestamp_seconds > 0 and gitops_backup_last_timestamp_seconds > 0",
+          "legendFormat": "{{env}}",
+          "instant": true
+        }
+      ],
+      "options": {
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 108000
+              },
+              {
+                "color": "red",
+                "value": 129600
+              }
+            ]
+          },
+          "noValue": "no data yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 63,
+      "type": "stat",
+      "title": "Backup size",
+      "description": "Size of the newest verified dump.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 71,
+        "w": 8,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "gitops_backup_last_size_bytes",
+          "legendFormat": "{{env}}",
+          "instant": true
+        }
+      ],
+      "options": {
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "no data yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 64,
+      "type": "stat",
+      "title": "Backup failures (24h)",
+      "description": "pg_dump errors or dumps that pg_restore could not read.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 71,
+        "w": 8,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(gitops_backup_failures_total[24h])",
+          "legendFormat": "{{env}}",
+          "instant": true
+        }
+      ],
+      "options": {
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "no data yet"
         },
         "overrides": []
       }

@@ -1,7 +1,10 @@
 # Recording rules and alerts. Unit tested by tests/monitoring/rules_test.yml
 # (`promtool test rules`), which CI runs on every change.
 #
-# Severities: page = notify now (high-priority push), warn = notify, look soon.
+# Severities: page = notify now (Sentinel "high" -> Discord), warn = look soon
+# (Sentinel "medium", inbox only). mitre_* labels set Sentinel's ATT&CK mapping;
+# availability problems use the techniques an attacker causing them would
+# (T1489 Service Stop, T1499 Endpoint DoS), as Sentinel's own detections do.
 
 groups:
   # ---------------------------------------------------------------------------
@@ -27,7 +30,7 @@ groups:
       - alert: EndpointDown
         expr: probe_success{job="probe-app"} == 0
         for: 2m
-        labels: { severity: page }
+        labels: { severity: page, mitre_technique: T1489, mitre_tactic: Impact }
         annotations:
           summary: "{{ $labels.env }} is not serving: /ready probe failing for 2m"
           runbook: docs/OPERATIONS.md#troubleshooting
@@ -35,7 +38,7 @@ groups:
       - alert: HighErrorRatio
         expr: env:http_error_ratio:rate2m > 0.05
         for: 5m
-        labels: { severity: page }
+        labels: { severity: page, mitre_technique: T1499, mitre_tactic: Impact }
         annotations:
           summary: "{{ $labels.env }}: {{ $value | humanizePercentage }} of requests failing"
 
@@ -50,7 +53,7 @@ groups:
       - alert: WorkerHeartbeatStale
         expr: worker_heartbeat_age_seconds{job="api"} > 60
         for: 2m
-        labels: { severity: page }
+        labels: { severity: page, mitre_technique: T1489, mitre_tactic: Impact }
         annotations:
           summary: "{{ $labels.env }}: no live worker (last heartbeat {{ $value | humanizeDuration }} ago); tasks are not being processed"
 
@@ -71,7 +74,7 @@ groups:
       - alert: TargetDown
         expr: up{job=~"api|worker"} == 0
         for: 2m
-        labels: { severity: page }
+        labels: { severity: page, mitre_technique: T1489, mitre_tactic: Impact }
         annotations:
           summary: "{{ $labels.job }} in {{ $labels.env }} is not being scraped"
 
@@ -88,7 +91,7 @@ groups:
       - alert: ObservabilityComponentDown
         expr: probe_success{job="probe-observability"} == 0
         for: 5m
-        labels: { severity: warn }
+        labels: { severity: warn, mitre_technique: T1562.006, mitre_tactic: Defense Evasion }
         annotations:
           summary: "{{ $labels.component }} is unhealthy"
 
@@ -100,7 +103,7 @@ groups:
           node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
             / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"} < 0.10
         for: 5m
-        labels: { severity: page }
+        labels: { severity: page, mitre_technique: T1499, mitre_tactic: Impact }
         annotations:
           summary: "{{ $labels.mountpoint }} has {{ $value | humanizePercentage }} free"
 
@@ -111,14 +114,14 @@ groups:
           node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
             / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"} < 0.25
         for: 30m
-        labels: { severity: warn }
+        labels: { severity: warn, mitre_technique: T1499, mitre_tactic: Impact }
         annotations:
           summary: "{{ $labels.mountpoint }} is on track to fill within 24h"
 
       - alert: HostMemoryPressure
         expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
         for: 10m
-        labels: { severity: warn }
+        labels: { severity: warn, mitre_technique: T1499, mitre_tactic: Impact }
         annotations:
           summary: "only {{ $value | humanizePercentage }} memory available"
 
@@ -136,7 +139,7 @@ groups:
     rules:
       - alert: GitOpsAgentStale
         expr: time() - gitops_agent_last_run_timestamp_seconds > 600
-        labels: { severity: page }
+        labels: { severity: page, mitre_technique: T1562, mitre_tactic: Defense Evasion }
         annotations:
           summary: "GitOps agent hasn't completed a run in {{ $value | humanizeDuration }}; deploys and drift healing are stopped"
           description: "systemctl status gitops-agent.timer; journalctl -u gitops-agent"
@@ -151,7 +154,7 @@ groups:
       - alert: GitOpsEnvironmentUnhealthy
         expr: gitops_environment_state{state=~"failed|degraded"} == 1
         for: 15m
-        labels: { severity: page }
+        labels: { severity: page, mitre_technique: T1489, mitre_tactic: Impact }
         annotations:
           summary: "{{ $labels.env }} is {{ $labels.state }} according to the GitOps agent"
 
@@ -162,12 +165,27 @@ groups:
           summary: "{{ $labels.env }} was automatically rolled back"
           description: "cat /var/lib/gitops-agent/{{ $labels.env }}/status.json"
 
+      # T1490 Inhibit System Recovery: what missing backups amount to.
+      - alert: DatabaseBackupStale
+        expr: time() - gitops_backup_last_timestamp_seconds > 36 * 3600
+        for: 30m
+        labels: { severity: warn, mitre_technique: T1490, mitre_tactic: Impact }
+        annotations:
+          summary: "{{ $labels.env }}: last verified database backup was {{ $value | humanizeDuration }} ago"
+          description: "ls -lt /var/lib/gitops-agent/backups/{{ $labels.env }}; journalctl -u gitops-agent | grep backup"
+
+      - alert: DatabaseBackupFailing
+        expr: increase(gitops_backup_failures_total[2h]) > 0
+        labels: { severity: warn, mitre_technique: T1490, mitre_tactic: Impact }
+        annotations:
+          summary: "{{ $labels.env }}: a database backup failed or could not be verified"
+
   # ---------------------------------------------------------------------------
   - name: meta
     rules:
-      # Always firing. Alertmanager forwards it to healthchecks.io every
-      # minute; if those pings stop, healthchecks.io notifies you. This is
-      # what catches "the whole box is down".
+      # Always firing. Alertmanager forwards it to Sentinel every minute as a
+      # heartbeat; if it stops arriving, Sentinel raises "Monitoring on ai-lab
+      # stopped reporting". This is what catches "the whole box is down".
       - alert: Watchdog
         expr: vector(1)
         labels: { severity: none }

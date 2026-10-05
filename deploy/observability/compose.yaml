@@ -1,20 +1,20 @@
 # Observability stack, shared by both environments. Run once on AI-LAB (not
 # managed by the GitOps agent):
 #
-#   deploy/observability/configure-alerts.sh   # once: ntfy + dead man's switch
+#   sudo deploy/observability/configure-alerts.sh --sentinel http://<ip>:8088   # once
 #   cd deploy/observability && docker compose --env-file grafana.env up -d
 #
 # What watches what:
 #
 #   prometheus      scrapes everything below, evaluates SLO + alert rules
-#   alertmanager    routes alerts to your phone (ntfy) and pings an external
-#                   dead man's switch (healthchecks.io) every minute, so you
-#                   hear about it even if AI-LAB itself goes down
+#   alertmanager    sends every alert (and its resolution) to Sentinel, plus
+#                   a heartbeat every minute; if the heartbeat stops, Sentinel
+#                   tells you that AI-LAB's monitoring itself went down
 #   blackbox        probes app endpoints like a user would, plus the external
 #                   services the deploy path depends on (GHCR, GitHub, Sigstore)
 #   node-exporter   host disk, memory, CPU, clock skew; also publishes the
 #                   GitOps agent's own metrics (textfile collector)
-#   grafana         dashboards, LAN only on :3000
+#   grafana         dashboards on :${GRAFANA_PORT:-3000} (set in grafana.env)
 #
 # Prometheus and Alertmanager listen on localhost only (the GitOps agent uses
 # Prometheus for its rollback SLO check). Everything else is internal.
@@ -55,8 +55,8 @@ services:
       - --storage.path=/alertmanager
     volumes:
       - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-      # Written by configure-alerts.sh; contains your ntfy topic and
-      # healthchecks.io ping URL. Never committed (see .gitignore).
+      # Written by configure-alerts.sh: Sentinel's URL and its ingest-only
+      # key. Never committed (see .gitignore).
       - ./secrets:/etc/alertmanager/secrets:ro
       - alertmanager-data:/alertmanager
     ports:
@@ -104,7 +104,9 @@ services:
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     ports:
-      - "3000:3000"
+      # Open WebUI (NexusLLM) also defaults to 3000; set GRAFANA_PORT in
+      # grafana.env if it runs on this host.
+      - "${GRAFANA_PORT:-3000}:3000"
     depends_on: [prometheus]
 
 volumes:

@@ -15,7 +15,21 @@ tests:
         values: '0+90x40'
       - series: 'http_requests_total{job="api",env="staging",route="/",method="GET",status="500"}'
         values: '0+10x40'
+      # p95 latency: 90% of requests under 0.1s, 10% between 0.5s and 1s.
+      - series: 'http_request_duration_seconds_bucket{job="api",env="staging",method="GET",route="/",le="0.1"}'
+        values: '0+90x40'
+      - series: 'http_request_duration_seconds_bucket{job="api",env="staging",method="GET",route="/",le="0.5"}'
+        values: '0+90x40'
+      - series: 'http_request_duration_seconds_bucket{job="api",env="staging",method="GET",route="/",le="1"}'
+        values: '0+100x40'
+      - series: 'http_request_duration_seconds_bucket{job="api",env="staging",method="GET",route="/",le="+Inf"}'
+        values: '0+100x40'
     promql_expr_test:
+      - expr: round(env:http_latency_p95_seconds:rate5m, 0.01)
+        eval_time: 6m
+        exp_samples:
+          - labels: '{env="staging"}'
+            value: 0.75        # halfway through the 0.5-1s bucket
       - expr: env:http_error_ratio:rate2m
         eval_time: 4m
         exp_samples:
@@ -28,7 +42,7 @@ tests:
       - alertname: HighErrorRatio
         eval_time: 6m
         exp_alerts:
-          - exp_labels: { severity: page, env: staging }
+          - exp_labels: { severity: page, env: staging, mitre_technique: T1499, mitre_tactic: Impact }
             exp_annotations:
               summary: "staging: 10% of requests failing"
 
@@ -49,6 +63,8 @@ tests:
               env: production
               job: probe-app
               instance: http://api-production:8000/ready
+              mitre_technique: T1489
+              mitre_tactic: Impact
             exp_annotations:
               summary: "production is not serving: /ready probe failing for 2m"
               runbook: docs/OPERATIONS.md#troubleshooting
@@ -65,7 +81,7 @@ tests:
       - alertname: WorkerHeartbeatStale
         eval_time: 3m30s
         exp_alerts:
-          - exp_labels: { severity: page, env: staging, job: api }
+          - exp_labels: { severity: page, env: staging, job: api, mitre_technique: T1489, mitre_tactic: Impact }
             exp_annotations:
               summary: "staging: no live worker (last heartbeat +Inf ago); tasks are not being processed"
 
@@ -118,7 +134,7 @@ tests:
       - alertname: GitOpsAgentStale
         eval_time: 11m
         exp_alerts:
-          - exp_labels: { severity: page, job: node }
+          - exp_labels: { severity: page, job: node, mitre_technique: T1562, mitre_tactic: "Defense Evasion" }
             exp_annotations:
               summary: "GitOps agent hasn't completed a run in 11m 0s; deploys and drift healing are stopped"
               description: "systemctl status gitops-agent.timer; journalctl -u gitops-agent"
@@ -152,7 +168,7 @@ tests:
       - alertname: HostDiskWillFillSoon
         eval_time: 1h
         exp_alerts:
-          - exp_labels: { severity: warn, job: node, mountpoint: /, fstype: ext4, device: /dev/sda1 }
+          - exp_labels: { severity: warn, job: node, mountpoint: /, fstype: ext4, device: /dev/sda1, mitre_technique: T1499, mitre_tactic: Impact }
             exp_annotations:
               summary: "/ is on track to fill within 24h"
       - alertname: HostDiskAlmostFull
@@ -161,7 +177,7 @@ tests:
       - alertname: HostDiskAlmostFull
         eval_time: 2h
         exp_alerts:
-          - exp_labels: { severity: page, job: node, mountpoint: /, fstype: ext4, device: /dev/sda1 }
+          - exp_labels: { severity: page, job: node, mountpoint: /, fstype: ext4, device: /dev/sda1, mitre_technique: T1499, mitre_tactic: Impact }
             exp_annotations:
               summary: "/ has 8% free"
 
@@ -205,7 +221,7 @@ tests:
       - alertname: TargetDown
         eval_time: 3m
         exp_alerts:
-          - exp_labels: { severity: page, env: production, job: worker, instance: "worker-production:9100" }
+          - exp_labels: { severity: page, env: production, job: worker, instance: "worker-production:9100", mitre_technique: T1489, mitre_tactic: Impact }
             exp_annotations:
               summary: "worker in production is not being scraped"
 
@@ -226,19 +242,19 @@ tests:
       - alertname: ObservabilityComponentDown
         eval_time: 6m
         exp_alerts:
-          - exp_labels: { severity: warn, job: probe-observability, component: grafana, instance: "http://grafana:3000/api/health" }
+          - exp_labels: { severity: warn, job: probe-observability, component: grafana, instance: "http://grafana:3000/api/health", mitre_technique: T1562.006, mitre_tactic: "Defense Evasion" }
             exp_annotations:
               summary: "grafana is unhealthy"
       - alertname: HostMemoryPressure
         eval_time: 11m
         exp_alerts:
-          - exp_labels: { severity: warn, job: node }
+          - exp_labels: { severity: warn, job: node, mitre_technique: T1499, mitre_tactic: Impact }
             exp_annotations:
               summary: "only 1.562% memory available"
       - alertname: GitOpsEnvironmentUnhealthy
         eval_time: 16m
         exp_alerts:
-          - exp_labels: { severity: page, job: node, env: production, state: failed }
+          - exp_labels: { severity: page, job: node, env: production, state: failed, mitre_technique: T1489, mitre_tactic: Impact }
             exp_annotations:
               summary: "production is failed according to the GitOps agent"
       # No agent metrics at all in this case.
@@ -248,6 +264,35 @@ tests:
           - exp_labels: { severity: warn }
             exp_annotations:
               summary: "no GitOps agent metrics; agent not installed, or METRICS_DIR not mounted into node-exporter"
+
+  # --- database backups -------------------------------------------------------
+  - interval: 5m
+    input_series:
+      # Last backup at t=0, nothing since; one failure at 3h.
+      - series: 'gitops_backup_last_timestamp_seconds{job="node",env="production"}'
+        values: '0x500'
+      - series: 'gitops_backup_failures_total{job="node",env="production"}'
+        values: '0x36 1x100'
+    alert_rule_test:
+      - alertname: DatabaseBackupStale
+        eval_time: 30h
+        exp_alerts: []
+      - alertname: DatabaseBackupStale
+        eval_time: 37h
+        exp_alerts:
+          - exp_labels: { severity: warn, job: node, env: production, mitre_technique: T1490, mitre_tactic: Impact }
+            exp_annotations:
+              summary: "production: last verified database backup was 1d 13h 0m 0s ago"
+              description: "ls -lt /var/lib/gitops-agent/backups/production; journalctl -u gitops-agent | grep backup"
+      - alertname: DatabaseBackupFailing
+        eval_time: 4h
+        exp_alerts:
+          - exp_labels: { severity: warn, job: node, env: production, mitre_technique: T1490, mitre_tactic: Impact }
+            exp_annotations:
+              summary: "production: a database backup failed or could not be verified"
+      - alertname: DatabaseBackupFailing
+        eval_time: 6h
+        exp_alerts: []          # no new failures in the last 2h
 
   # --- the dead man's switch is always on ------------------------------------
   - interval: 1m

@@ -1,74 +1,102 @@
 #!/usr/bin/env bash
-# One-time alert setup on AI-LAB. Writes the two secret files Alertmanager
-# reads (never committed) and optionally sends a test notification.
+# One-time alert setup on AI-LAB: send everything to Sentinel
+# (KevinTechLabs/Homelab-Soc-Dashboard, v1.7.0 or newer).
 #
-#   deploy/observability/configure-alerts.sh \
-#     --ntfy https://ntfy.sh/<your-private-topic> \
-#     --healthchecks https://hc-ping.com/<uuid> \
-#     --test
+#   sudo deploy/observability/configure-alerts.sh --sentinel http://<sentinel-ip>:8088
 #
-#   --ntfy          where alerts are pushed. Pick a long, unguessable topic
-#                   name: anyone who knows it can read your alerts. Install the
-#                   ntfy app on your phone and subscribe to the same topic.
-#   --healthchecks  ping URL of a healthchecks.io check (free). Configure the
-#                   check with Period 1 minute, Grace 5 minutes, and connect
-#                   your phone/email there. If AI-LAB stops pinging, that is
-#                   the alert that the whole box (or its monitoring) is down.
+# You'll be asked for Sentinel's *ingest key* (on the Sentinel server:
+# `sudo cat /etc/sentinel/ingest_token`). It can only push alerts in, so a copy
+# on this machine can't block addresses or change your router.
+#
+# Writes (none of it committed):
+#   deploy/observability/secrets/sentinel_url, sentinel_key   read by Alertmanager
+#   /etc/gitops-agent/sentinel_key + SENTINEL_URL in agent.env  deploy events
+# then sends a test event so you can see it arrive in Sentinel.
+#
+# Options:
+#   --key-file <path>   read the key from a file instead of prompting
+#   --source <name>     how this host appears in Sentinel (default: ai-lab;
+#                       must match `host` in prometheus/prometheus.yml)
 
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 secrets="$here/secrets"
-ntfy="" healthchecks="" test=false
+sentinel="" key_file="" source="ai-lab"
+agent_dir=/etc/gitops-agent
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ntfy) ntfy="$2"; shift 2 ;;
-    --healthchecks) healthchecks="$2"; shift 2 ;;
-    --test) test=true; shift ;;
-    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    --sentinel) sentinel="${2%/}"; shift 2 ;;
+    --key-file) key_file="$2"; shift 2 ;;
+    --source) source="$2"; shift 2 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
-[[ "$ntfy" =~ ^https://[^/]+/[A-Za-z0-9_-]{8,}$ ]] \
-  || { echo "--ntfy must look like https://ntfy.sh/<topic> (topic: 8+ letters, digits, _ or -)" >&2; exit 2; }
-[[ "$healthchecks" =~ ^https://[^[:space:]]+$ ]] \
-  || { echo "--healthchecks must be an https ping URL" >&2; exit 2; }
+[[ $EUID -eq 0 ]] || { echo "run with sudo (secrets are owned by the containers' users)" >&2; exit 1; }
+[[ "$sentinel" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] \
+  || { echo "--sentinel must look like http://192.168.1.50:8088 (no path)" >&2; exit 2; }
+[[ "$source" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { echo "--source: letters, digits, . _ - only" >&2; exit 2; }
 
-# ntfy renders Alertmanager's JSON webhook through these inline templates
-# (title, message, priority), so alerts read like sentences, not JSON.
-ntfy_alert_url="$(python3 - "$ntfy" <<'PY'
-import sys, urllib.parse
-base = sys.argv[1]
-title = ('{{if eq .status "resolved"}}RESOLVED{{else}}FIRING{{end}}: '
-         '{{.commonLabels.alertname}}{{if .commonLabels.env}} ({{.commonLabels.env}}){{end}}')
-message = '{{range .alerts}}{{.annotations.summary}}{{"\\n"}}{{end}}'
-priority = ('{{if eq .status "resolved"}}2{{else if eq .commonLabels.severity "page"}}5'
-            '{{else}}3{{end}}')
-print(base + "?" + urllib.parse.urlencode({"tpl": "yes", "t": title, "m": message, "p": priority}))
-PY
-)"
+if [[ -n "$key_file" ]]; then
+  key="$(tr -d '[:space:]' < "$key_file")"
+else
+  read -rsp "Sentinel ingest key (sudo cat /etc/sentinel/ingest_token on the Sentinel server): " key
+  echo
+fi
+[[ "$key" =~ ^[A-Za-z0-9_-]{16,}$ ]] || { echo "that doesn't look like a Sentinel key" >&2; exit 2; }
 
-# Alertmanager runs as `nobody` inside its container, so the bind-mounted
-# files must be world-readable. Keep this box single-user, or move them to
-# Docker secrets if that ever changes.
+# 1. Prove the URL and key work before writing anything.
+echo "==> Testing $sentinel"
+code="$(curl -sS -o /tmp/sentinel-test.$$ -w '%{http_code}' -m 10 \
+  -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
+  -d "{\"source\":\"$source\",\"kind\":\"GitOps\",\"level\":\"info\",\"title\":\"Alerting connected\",\"text\":\"Alertmanager and the GitOps agent on $source are now reporting to Sentinel\"}" \
+  "$sentinel/api/ingest/event" || true)"
+body="$(cat /tmp/sentinel-test.$$ 2>/dev/null || true)"; rm -f /tmp/sentinel-test.$$
+case "$code" in
+  200) echo "    ok: test event accepted (look for it in Sentinel's activity feed)" ;;
+  401) echo "    Sentinel rejected the key" >&2; exit 1 ;;
+  404) echo "    Sentinel answered but has no ingest endpoint; update it to v1.7.0+ (re-run its install-server.sh)" >&2; exit 1 ;;
+  000) echo "    could not reach $sentinel (firewall? wrong port? is nginx up on the Sentinel server?)" >&2; exit 1 ;;
+  *)   echo "    unexpected HTTP $code: $body" >&2; exit 1 ;;
+esac
+
+# 2. Alertmanager's copies. It runs as nobody (65534) inside its container.
 install -d -m 0755 "$secrets"
-umask 022
-printf '%s\n' "$ntfy_alert_url" > "$secrets/ntfy_url"
-printf '%s\n' "$healthchecks" > "$secrets/healthchecks_url"
-echo "wrote $secrets/ntfy_url and $secrets/healthchecks_url"
+umask 077
+printf '%s/api/ingest/alertmanager\n' "$sentinel" > "$secrets/sentinel_url"
+printf '%s\n' "$key" > "$secrets/sentinel_key"
+chown 65534:65534 "$secrets/sentinel_url" "$secrets/sentinel_key"
+chmod 0400 "$secrets/sentinel_url" "$secrets/sentinel_key"
+echo "==> Wrote Alertmanager secrets in $secrets"
 
-if $test; then
-  curl -fsS -m 10 -H "Title: AI-LAB alerting test" -H "Tags: white_check_mark" \
-    -d "If you can read this on your phone, alert delivery works." "$ntfy" >/dev/null \
-    && echo "sent test notification to $ntfy"
-  curl -fsS -m 10 "$healthchecks" >/dev/null && echo "pinged healthchecks.io"
+# 3. The GitOps agent's copy (deploy / rollback / refused-image events).
+if [[ -d "$agent_dir" ]]; then
+  printf '%s\n' "$key" > "$agent_dir/sentinel_key"
+  chown root:gitops "$agent_dir/sentinel_key" 2>/dev/null || true
+  chmod 0640 "$agent_dir/sentinel_key"
+  conf="$agent_dir/agent.env"
+  for kv in "SENTINEL_URL=$sentinel" "SENTINEL_KEY_FILE=$agent_dir/sentinel_key" "SENTINEL_SOURCE=$source"; do
+    k="${kv%%=*}"
+    if grep -q "^$k=" "$conf" 2>/dev/null; then
+      sed -i "s#^$k=.*#$kv#" "$conf"
+    else
+      printf '%s\n' "$kv" >> "$conf"
+    fi
+  done
+  echo "==> Configured the GitOps agent ($conf)"
+else
+  echo "==> GitOps agent not installed yet; re-run this after deploy/agent/install.sh"
 fi
 
 cat <<EOF
 
-Next:
-  - Apply:  cd $here && docker compose --env-file grafana.env up -d && docker compose restart alertmanager
-  - Deploy events from the GitOps agent: set NOTIFY_URL=$ntfy in /etc/gitops-agent/agent.env
+Done. Apply with:
+  cd $here && docker compose --env-file grafana.env up -d && docker compose restart alertmanager
+
+Within a minute Sentinel starts receiving the Watchdog heartbeat from "$source".
+From then on, if this host goes quiet for 5 minutes, Sentinel raises
+"Monitoring on $source stopped reporting".
 EOF

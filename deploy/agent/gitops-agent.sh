@@ -9,7 +9,8 @@
 #   1. refuses production digests that have not first passed on staging here
 #   2. verifies the image's Sigstore signature and SBOM attestation
 #   3. pulls, then runs database migrations while the old release still serves
-#   4. checks the host has enough free disk for the new images
+#   4. checks the host has enough free disk for the new images, and for
+#      production takes a verified pg_dump before touching the schema
 #   5. replaces the app containers and waits until /ready passes, the API
 #      reports the new version, AND a worker running the new version is
 #      heartbeating (so a crash-looping worker can't slip through)
@@ -18,7 +19,7 @@
 #      back to the last good release and remembers the bad revision
 #
 # It also self-heals drift (restarts the applied release if its containers
-# stop), prunes old release images, and exports its own metrics through the
+# stop), takes a daily database backup, prunes old release images, and exports its own metrics through the
 # node-exporter textfile collector so Prometheus can alert if it stops running.
 #
 # Run by systemd (deploy/agent/gitops-agent.timer). Config: agent.env.
@@ -45,11 +46,17 @@ VERIFY_SIGNATURES="${VERIFY_SIGNATURES:-true}"
 REQUIRE_SBOM_ATTESTATION="${REQUIRE_SBOM_ATTESTATION:-true}"
 COSIGN_ISSUER="${COSIGN_ISSUER:-https://token.actions.githubusercontent.com}"
 COSIGN_IDENTITY_REGEXP="${COSIGN_IDENTITY_REGEXP:-}"
-NOTIFY_URL="${NOTIFY_URL:-}"
+SENTINEL_URL="${SENTINEL_URL:-}"
+SENTINEL_KEY_FILE="${SENTINEL_KEY_FILE:-/etc/gitops-agent/sentinel_key}"
+SENTINEL_SOURCE="${SENTINEL_SOURCE:-ai-lab}"
 MIN_FREE_DISK_MB="${MIN_FREE_DISK_MB:-2048}"
 PRUNE_IMAGES="${PRUNE_IMAGES:-true}"
 PRUNE_AFTER="${PRUNE_AFTER:-168h}"
 METRICS_DIR="${METRICS_DIR:-$STATE_DIR/metrics}"
+BACKUP_ENVIRONMENTS="${BACKUP_ENVIRONMENTS:-production}"
+BACKUP_DIR="${BACKUP_DIR:-$STATE_DIR/backups}"
+BACKUP_KEEP="${BACKUP_KEEP:-14}"
+BACKUP_EVERY_HOURS="${BACKUP_EVERY_HOURS:-24}"
 
 REPO_DIR="$STATE_DIR/repo"
 VERIFIED_DIGESTS="$STATE_DIR/verified-digests"
@@ -58,15 +65,20 @@ log()  { printf '%s [%s] %s\n' "$(date -u +%FT%TZ)" "${CURRENT_ENV:-agent}" "$*"
 warn() { log "WARN: $*" >&2; }
 
 notify() {
-  # notify <priority> <message>. Any webhook accepting a plain-text POST works;
-  # the Title/Priority/Tags headers are understood by ntfy and ignored elsewhere.
-  local priority="$1"; shift
-  [[ -n "$NOTIFY_URL" ]] || return 0
-  curl -fsS -m 10 \
-    -H "Title: gitops ${CURRENT_ENV:-agent} on $HOSTNAME" \
-    -H "Priority: $priority" \
-    -H "Tags: rocket" \
-    -d "$*" "$NOTIFY_URL" >/dev/null || warn "notify failed"
+  # notify <level> <title> <text> [dedupe-key] [ATT&CK technique] [tactic]
+  # Sends a deploy event to Sentinel (Homelab-Soc-Dashboard). level "info" only
+  # goes to its activity feed; low..critical raise an alert there (high and
+  # critical also reach Discord). Optional: without SENTINEL_URL it's a no-op.
+  local level="$1" title="$2" text="$3" key="${4:-}" tech="${5:-}" tac="${6:-}" payload
+  [[ -n "$SENTINEL_URL" && -r "$SENTINEL_KEY_FILE" ]] || return 0
+  payload="$(python3 -c 'import json, sys
+k = ["source", "kind", "level", "title", "text", "key", "technique", "tactic"]
+print(json.dumps({a: b for a, b in zip(k, sys.argv[1:]) if b}))' \
+    "$SENTINEL_SOURCE" GitOps "$level" "$title" "$text" "$key" "$tech" "$tac")"
+  # Header from a file descriptor so the key never appears in the process list.
+  curl -fsS -m 10 -H @<(printf 'Authorization: Bearer %s\n' "$(tr -d '[:space:]' < "$SENTINEL_KEY_FILE")") \
+    -H 'Content-Type: application/json' -d "$payload" \
+    "$SENTINEL_URL/api/ingest/event" >/dev/null || warn "could not reach Sentinel"
 }
 
 bump() { # bump <file>: increment a persisted counter
@@ -229,6 +241,8 @@ rollback() {
   warn "rolling back: $reason"
   echo "$rev" > "$STATE_DIR/$env/failed.rev"
   bump "$STATE_DIR/$env/rollbacks_total"
+  # DORA: a failed change starts an incident; the next good deploy ends it.
+  [[ -f "$STATE_DIR/$env/incident_start" ]] || date +%s > "$STATE_DIR/$env/incident_start"
   if [[ -f "$applied/release.env" ]]; then
     local prev_version port
     prev_version="$(env_value "$applied/release.env" APP_VERSION)"
@@ -237,18 +251,23 @@ rollback() {
     if wait_ready "$port" "$prev_version"; then
       log "rolled back to ${prev_version:0:12}"
       write_status "$env" rolled_back "$reason" "$prev_version"
-      notify high "ROLLED BACK ${version:0:12} -> ${prev_version:0:12}: $reason"
+      notify high "$env rolled back" \
+        "Rolled back ${version:0:12} -> ${prev_version:0:12}: $reason. The bad release won't be retried." \
+        "rollback:$env:$version"
     else
       warn "previous release ${prev_version:0:12} is not ready either; manual attention needed"
       write_status "$env" degraded "rollback target not ready: $reason" "$prev_version"
-      notify urgent "DEGRADED: rollback to ${prev_version:0:12} not ready ($reason)"
+      notify critical "$env is degraded" \
+        "Deploy of ${version:0:12} failed ($reason) and the rollback target ${prev_version:0:12} is not ready either. Manual attention needed." \
+        "degraded:$env:$version" T1489 Impact
     fi
   else
     # First-ever deploy failed: nothing to go back to. Stop the broken app
     # (keep the database volume) rather than leave it serving errors.
     compose "$env" "$STATE_DIR/$env/incoming" stop api worker || true
     write_status "$env" failed "first deploy failed, app stopped: $reason" "$version"
-    notify urgent "FAILED first deploy of ${version:0:12}: $reason"
+    notify high "$env first deploy failed" "First deploy of ${version:0:12} failed ($reason); app stopped, database kept." \
+      "firstdeploy:$env:$version"
   fi
 }
 
@@ -276,6 +295,48 @@ prune_images() {
     || warn "image prune failed"
 }
 
+backs_up() { [[ " $BACKUP_ENVIRONMENTS " == *" $1 "* ]]; }
+
+backup_db() {
+  # backup_db <env> <release dir> <reason>: pg_dump (custom format) from the
+  # env's running database, verified with pg_restore --list before it counts.
+  local env="$1" dir="$2" reason="$3" version stamp out tmp entries bytes
+  version="$(env_value "$dir/release.env" APP_VERSION)"
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$BACKUP_DIR/$env"
+  chmod 0700 "$BACKUP_DIR" "$BACKUP_DIR/$env"
+  out="$BACKUP_DIR/$env/$stamp-$reason-${version:0:12}.dump"
+  tmp="$out.partial"
+  if ! compose "$env" "$dir" exec -T db pg_dump -U app -d app --format=custom > "$tmp"; then
+    rm -f "$tmp"; bump "$STATE_DIR/$env/backup_failures_total"
+    warn "backup ($reason) failed: pg_dump error"; return 1
+  fi
+  entries="$(compose "$env" "$dir" exec -T db pg_restore --list < "$tmp" 2>/dev/null | grep -c '^[0-9]' || true)"
+  if [[ "${entries:-0}" -lt 1 ]]; then
+    rm -f "$tmp"; bump "$STATE_DIR/$env/backup_failures_total"
+    warn "backup ($reason) failed verification: pg_restore could not read it"; return 1
+  fi
+  mv "$tmp" "$out"
+  chmod 0600 "$out"
+  bytes="$(stat -c %s "$out")"
+  date +%s > "$STATE_DIR/$env/last_backup"
+  echo "$bytes" > "$STATE_DIR/$env/last_backup_bytes"
+  # Keep the newest BACKUP_KEEP dumps.
+  find "$BACKUP_DIR/$env" -maxdepth 1 -name '*.dump' -printf '%T@ %p\n' \
+    | sort -rn | tail -n +"$((BACKUP_KEEP + 1))" | cut -d' ' -f2- | xargs -r rm -f
+  log "backup ($reason): $(basename "$out"), $bytes bytes, $entries objects"
+}
+
+daily_backup() {
+  local env="$1" applied="$STATE_DIR/$1/applied" last
+  backs_up "$env" && [[ -f "$applied/release.env" ]] || return 0
+  last="$(cat "$STATE_DIR/$env/last_backup" 2>/dev/null || echo 0)"
+  (( $(date +%s) - last >= BACKUP_EVERY_HOURS * 3600 )) || return 0
+  backup_db "$env" "$applied" daily \
+    || notify medium "$env daily backup failed" "The scheduled database backup failed; see journalctl -u gitops-agent." \
+         "backup:$env:$(date +%Y%m%d)"
+}
+
 heal_drift() {
   local env="$1"
   local applied="$STATE_DIR/$env/applied" running
@@ -285,7 +346,8 @@ heal_drift() {
     warn "drift: running services are [${running}]; restoring applied release"
     compose "$env" "$applied" up -d --remove-orphans db api worker
     bump "$STATE_DIR/$env/drift_heals_total"
-    notify high "healed drift (running: ${running:-none})"
+    notify medium "$env drift healed" "Containers of the applied release had stopped (running: ${running:-none}); restarted them." \
+      "drift:$env:$(date +%Y%m%d%H)"
   fi
 }
 
@@ -337,13 +399,16 @@ reconcile_env() {
     warn "signature verification FAILED for $image"
     echo "$rev" > "$dir/failed.rev"
     write_status "$env" failed "signature verification failed" "$version"
-    notify urgent "REFUSED ${version:0:12}: signature verification failed"
+    notify critical "Refused unsigned image ($env)" \
+      "Image $image for ${version:0:12} failed Sigstore signature/SBOM verification and was NOT deployed. Either the image was not built by this repo's pipeline on main, or it was tampered with." \
+      "refused:$env:$version" T1195.002 "Initial Access"
     return 1
   fi
 
   if ! disk_preflight; then
     write_status "$env" failed "low disk space (will retry)" "$version"
-    notify high "BLOCKED ${version:0:12}: low disk space on $HOSTNAME"
+    notify medium "$env deploy blocked: low disk" "Not deploying ${version:0:12}: less than ${MIN_FREE_DISK_MB}MB free. Will retry automatically." \
+      "disk:$env:$version" T1499 Impact
     return 1
   fi
 
@@ -359,6 +424,18 @@ reconcile_env() {
     return 1
   fi
 
+  # Snapshot the database before the schema changes, so a bad migration is
+  # recoverable (deploy/agent/restore-db.sh). No backup, no migration.
+  if backs_up "$env" && [[ -f "$dir/applied/release.env" ]]; then
+    if ! backup_db "$env" "$dir/applied" "pre-${version:0:12}"; then
+      write_status "$env" failed "pre-migration backup failed (will retry)" "$version"
+      notify high "$env deploy blocked: backup failed" \
+        "Could not take a verified database backup before migrating to ${version:0:12}; not deploying. Will retry." \
+        "backup:$env:$version"
+      return 1
+    fi
+  fi
+
   # Migrations run while the previous release keeps serving. A failure here
   # leaves production exactly as it was.
   log "running migrations"
@@ -366,7 +443,8 @@ reconcile_env() {
     warn "migration failed; current release left untouched"
     echo "$rev" > "$dir/failed.rev"
     write_status "$env" failed "migration failed; previous release still serving" "$version"
-    notify high "FAILED ${version:0:12}: migration failed, previous release untouched"
+    notify high "$env migration failed" "Database migration for ${version:0:12} failed; the previous release is still serving untouched." \
+      "migration:$env:$version"
     return 1
   fi
 
@@ -393,10 +471,35 @@ reconcile_env() {
   fi
   bump "$dir/deploys_total"
   date +%s > "$dir/last_deploy"
+  record_dora "$env" "$dir/applied/release.env"
   prune_images
   log "deployed ${version:0:12}"
   write_status "$env" deployed "" "$version"
-  notify default "deployed ${version:0:12}"
+  notify info "$env deployed ${version:0:12}" "$env: deployed ${version:0:12} (signed, migrated, soaked)"
+}
+
+add_to() { # add_to <file> <number>: persisted running sum
+  local cur; cur="$(cat "$1" 2>/dev/null || echo 0)"
+  echo $((cur + $2)) > "$1"
+}
+
+record_dora() {
+  # Lead time for changes (commit -> running in this env) and time to restore
+  # service after a failed change, as running sums for Prometheus summaries.
+  local env="$1" release="$2" now committed started
+  local d="$STATE_DIR/$env"
+  now="$(date +%s)"
+  committed="$(env_value "$release" COMMIT_TIMESTAMP)"
+  if [[ "$committed" =~ ^[0-9]+$ ]] && ((committed > 0 && committed <= now)); then
+    add_to "$d/lead_time_sum" $((now - committed))
+    bump "$d/lead_time_count"
+  fi
+  if [[ -f "$d/incident_start" ]]; then
+    started="$(cat "$d/incident_start")"
+    add_to "$d/recovery_sum" $((now - started))
+    bump "$d/recovery_count"
+    rm -f "$d/incident_start"
+  fi
 }
 
 write_metrics() {
@@ -432,6 +535,8 @@ metric("gitops_agent_last_run_success", "1 if every environment reconciled clean
 metric("gitops_agent_last_run_duration_seconds", "Duration of the last run", "gauge", [({}, round(now - started, 3))])
 
 state_s, info_s, deploy_ts, deploys, rollbacks, heals = [], [], [], [], [], []
+backup_ts, backup_bytes, backup_fail = [], [], []
+lead_sum, lead_cnt, rec_sum, rec_cnt, open_incident = [], [], [], [], []
 for env in envs:
     d = os.path.join(state_dir, env)
     try:
@@ -447,6 +552,15 @@ for env in envs:
     deploys.append(({"env": env}, read(os.path.join(d, "deploys_total"))))
     rollbacks.append(({"env": env}, read(os.path.join(d, "rollbacks_total"))))
     heals.append(({"env": env}, read(os.path.join(d, "drift_heals_total"))))
+    lead_sum.append(({"env": env}, read(os.path.join(d, "lead_time_sum"))))
+    lead_cnt.append(({"env": env}, read(os.path.join(d, "lead_time_count"))))
+    rec_sum.append(({"env": env}, read(os.path.join(d, "recovery_sum"))))
+    rec_cnt.append(({"env": env}, read(os.path.join(d, "recovery_count"))))
+    open_incident.append(({"env": env}, read(os.path.join(d, "incident_start"))))
+    if os.path.exists(os.path.join(d, "last_backup")) or os.path.exists(os.path.join(d, "backup_failures_total")):
+        backup_ts.append(({"env": env}, read(os.path.join(d, "last_backup"))))
+        backup_bytes.append(({"env": env}, read(os.path.join(d, "last_backup_bytes"))))
+        backup_fail.append(({"env": env}, read(os.path.join(d, "backup_failures_total"))))
 
 metric("gitops_environment_state", "Current reconcile state per environment", "gauge", state_s)
 metric("gitops_environment_info", "Version the agent last acted on", "gauge", info_s)
@@ -454,6 +568,19 @@ metric("gitops_last_deploy_timestamp_seconds", "When the last successful deploy 
 metric("gitops_deploys_total", "Successful deploys", "counter", deploys)
 metric("gitops_rollbacks_total", "Automatic rollbacks", "counter", rollbacks)
 metric("gitops_drift_heals_total", "Times the applied release was restarted after drift", "counter", heals)
+# DORA. Summaries are exposed as _sum/_count pairs so rate() works over any window.
+out.append("# HELP gitops_lead_time_seconds Commit-to-running time of each successful deploy")
+out.append("# TYPE gitops_lead_time_seconds summary")
+out += [f'gitops_lead_time_seconds_sum{{env="{l["env"]}"}} {v}' for l, v in lead_sum]
+out += [f'gitops_lead_time_seconds_count{{env="{l["env"]}"}} {v}' for l, v in lead_cnt]
+out.append("# HELP gitops_recovery_seconds Time from a failed change to the next successful deploy")
+out.append("# TYPE gitops_recovery_seconds summary")
+out += [f'gitops_recovery_seconds_sum{{env="{l["env"]}"}} {v}' for l, v in rec_sum]
+out += [f'gitops_recovery_seconds_count{{env="{l["env"]}"}} {v}' for l, v in rec_cnt]
+metric("gitops_incident_open_since_timestamp_seconds", "Start of an unrecovered failed change (0 = none)", "gauge", open_incident)
+metric("gitops_backup_last_timestamp_seconds", "When the last verified database backup finished", "gauge", backup_ts)
+metric("gitops_backup_last_size_bytes", "Size of the last verified database backup", "gauge", backup_bytes)
+metric("gitops_backup_failures_total", "Database backups that failed or could not be verified", "counter", backup_fail)
 print("\n".join(out))
 PY
   chmod 0644 "$METRICS_DIR/gitops.prom.$$"
@@ -475,6 +602,8 @@ main() {
   if sync_repo; then
     for env in $ENVIRONMENTS; do
       reconcile_env "$env" || rc=1
+      CURRENT_ENV="$env"
+      daily_backup "$env" || true
       CURRENT_ENV=""
     done
   fi
