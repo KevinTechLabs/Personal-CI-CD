@@ -1,0 +1,260 @@
+# Unit tests for deploy/observability/prometheus/rules.yml.
+#   promtool test rules tests/monitoring/rules_test.yml
+# Each case feeds synthetic series and asserts which alerts fire, and when.
+
+rule_files:
+  - ../../deploy/observability/prometheus/rules.yml
+
+evaluation_interval: 15s
+
+tests:
+  # --- SLO recording rule feeding the agent's rollback decision -------------
+  - interval: 15s
+    input_series:
+      - series: 'http_requests_total{job="api",env="staging",route="/",method="GET",status="200"}'
+        values: '0+90x40'
+      - series: 'http_requests_total{job="api",env="staging",route="/",method="GET",status="500"}'
+        values: '0+10x40'
+    promql_expr_test:
+      - expr: env:http_error_ratio:rate2m
+        eval_time: 4m
+        exp_samples:
+          - labels: 'env:http_error_ratio:rate2m{env="staging"}'
+            value: 0.1
+    alert_rule_test:
+      - alertname: HighErrorRatio
+        eval_time: 4m
+        exp_alerts: []          # still inside the 5m "for"
+      - alertname: HighErrorRatio
+        eval_time: 6m
+        exp_alerts:
+          - exp_labels: { severity: page, env: staging }
+            exp_annotations:
+              summary: "staging: 10% of requests failing"
+
+  # --- endpoint down, and inhibition-relevant labels -------------------------
+  - interval: 15s
+    input_series:
+      - series: 'probe_success{job="probe-app",env="production",instance="http://api-production:8000/ready"}'
+        values: '1 1 1 0x20'
+    alert_rule_test:
+      - alertname: EndpointDown
+        eval_time: 1m
+        exp_alerts: []
+      - alertname: EndpointDown
+        eval_time: 3m
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              env: production
+              job: probe-app
+              instance: http://api-production:8000/ready
+            exp_annotations:
+              summary: "production is not serving: /ready probe failing for 2m"
+              runbook: docs/OPERATIONS.md#troubleshooting
+
+  # --- worker gone: heartbeat age is +Inf when no worker is alive -----------
+  - interval: 15s
+    input_series:
+      - series: 'worker_heartbeat_age_seconds{job="api",env="staging"}'
+        values: '5 5 5 5 +Inf+0x20'
+    alert_rule_test:
+      - alertname: WorkerHeartbeatStale
+        eval_time: 30s
+        exp_alerts: []
+      - alertname: WorkerHeartbeatStale
+        eval_time: 3m30s
+        exp_alerts:
+          - exp_labels: { severity: page, env: staging, job: api }
+            exp_annotations:
+              summary: "staging: no live worker (last heartbeat +Inf ago); tasks are not being processed"
+
+  # --- a degraded dependency check -------------------------------------------
+  - interval: 15s
+    input_series:
+      - series: 'readiness_check_state{job="api",env="staging",check="queue"}'
+        values: '2 2 1x30'
+      - series: 'readiness_check_state{job="api",env="staging",check="database"}'
+        values: '2x32'
+    alert_rule_test:
+      - alertname: ReadinessDegraded
+        eval_time: 6m
+        exp_alerts:
+          - exp_labels: { severity: warn, env: staging, check: queue }
+            exp_annotations:
+              summary: "staging: dependency check 'queue' not ok for 5m"
+              description: "curl http://ai-lab:<port>/ready for the per-dependency report"
+
+  # --- external dependency outage needs 15m before it alerts -----------------
+  - interval: 1m
+    input_series:
+      - series: 'probe_success{job="probe-deps",dependency="container-registry",instance="https://ghcr.io/v2/"}'
+        values: '0x20'
+    alert_rule_test:
+      - alertname: DeployDependencyUnreachable
+        eval_time: 10m
+        exp_alerts: []
+      - alertname: DeployDependencyUnreachable
+        eval_time: 16m
+        exp_alerts:
+          - exp_labels:
+              severity: warn
+              job: probe-deps
+              dependency: container-registry
+              instance: https://ghcr.io/v2/
+            exp_annotations:
+              summary: "AI-LAB cannot reach container-registry (https://ghcr.io/v2/); deploys will stall"
+
+  # --- GitOps agent stopped running ------------------------------------------
+  - interval: 1m
+    input_series:
+      # Last run recorded at t=0 and never again.
+      - series: 'gitops_agent_last_run_timestamp_seconds{job="node"}'
+        values: '0x20'
+    alert_rule_test:
+      - alertname: GitOpsAgentStale
+        eval_time: 9m
+        exp_alerts: []
+      - alertname: GitOpsAgentStale
+        eval_time: 11m
+        exp_alerts:
+          - exp_labels: { severity: page, job: node }
+            exp_annotations:
+              summary: "GitOps agent hasn't completed a run in 11m 0s; deploys and drift healing are stopped"
+              description: "systemctl status gitops-agent.timer; journalctl -u gitops-agent"
+
+  # --- a rollback is surfaced even if the agent's own notifier is off --------
+  - interval: 1m
+    input_series:
+      - series: 'gitops_rollbacks_total{job="node",env="staging"}'
+        values: '0 0 0 1 1 1 1 1'
+    alert_rule_test:
+      - alertname: GitOpsRolledBack
+        eval_time: 2m
+        exp_alerts: []
+      - alertname: GitOpsRolledBack
+        eval_time: 5m
+        exp_alerts:
+          - exp_labels: { severity: warn, env: staging, job: node }
+            exp_annotations:
+              summary: "staging was automatically rolled back"
+              description: "cat /var/lib/gitops-agent/staging/status.json"
+
+  # --- disk filling fast vs. disk merely full-ish ----------------------------
+  - interval: 1m
+    input_series:
+      # 100GB disk, 20GB free, losing 100MB a minute.
+      - series: 'node_filesystem_avail_bytes{job="node",mountpoint="/",fstype="ext4",device="/dev/sda1"}'
+        values: '20000000000-100000000x150'
+      - series: 'node_filesystem_size_bytes{job="node",mountpoint="/",fstype="ext4",device="/dev/sda1"}'
+        values: '100000000000x150'
+    alert_rule_test:
+      - alertname: HostDiskWillFillSoon
+        eval_time: 1h
+        exp_alerts:
+          - exp_labels: { severity: warn, job: node, mountpoint: /, fstype: ext4, device: /dev/sda1 }
+            exp_annotations:
+              summary: "/ is on track to fill within 24h"
+      - alertname: HostDiskAlmostFull
+        eval_time: 1h
+        exp_alerts: []          # 14% free: not yet critical
+      - alertname: HostDiskAlmostFull
+        eval_time: 2h
+        exp_alerts:
+          - exp_labels: { severity: page, job: node, mountpoint: /, fstype: ext4, device: /dev/sda1 }
+            exp_annotations:
+              summary: "/ has 8% free"
+
+  # --- clock drift breaks signature verification ------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'node_timex_offset_seconds{job="node"}'
+        values: '0.9x15'
+      - series: 'node_timex_sync_status{job="node"}'
+        values: '1x15'
+    alert_rule_test:
+      - alertname: HostClockSkew
+        eval_time: 11m
+        exp_alerts:
+          - exp_labels: { severity: warn, job: node }
+            exp_annotations:
+              summary: "host clock is unsynchronised; image signature checks may fail"
+
+  # --- worker backlog, slow probe, scrape target down -------------------------
+  - interval: 1m
+    input_series:
+      - series: 'queue_oldest_pending_age_seconds{job="api",env="production"}'
+        values: '700x10'
+      - series: 'probe_duration_seconds{job="probe-app",env="production",instance="http://api-production:8000/ready"}'
+        values: '1.5x15'
+      - series: 'up{job="worker",env="production",instance="worker-production:9100"}'
+        values: '0x5'
+    alert_rule_test:
+      - alertname: QueueBacklog
+        eval_time: 6m
+        exp_alerts:
+          - exp_labels: { severity: warn, env: production, job: api }
+            exp_annotations:
+              summary: "production: oldest task has waited 11m 40s"
+      - alertname: SlowReadinessProbe
+        eval_time: 11m
+        exp_alerts:
+          - exp_labels: { severity: warn, env: production, job: probe-app, instance: "http://api-production:8000/ready" }
+            exp_annotations:
+              summary: "production: /ready taking 1.5s"
+      - alertname: TargetDown
+        eval_time: 3m
+        exp_alerts:
+          - exp_labels: { severity: page, env: production, job: worker, instance: "worker-production:9100" }
+            exp_annotations:
+              summary: "worker in production is not being scraped"
+
+  # --- monitoring component, memory, agent metrics, environment health --------
+  - interval: 1m
+    input_series:
+      - series: 'probe_success{job="probe-observability",component="grafana",instance="http://grafana:3000/api/health"}'
+        values: '0x10'
+      - series: 'node_memory_MemAvailable_bytes{job="node"}'
+        values: '500000000x15'
+      - series: 'node_memory_MemTotal_bytes{job="node"}'
+        values: '32000000000x15'
+      - series: 'gitops_environment_state{job="node",env="production",state="failed"}'
+        values: '1x20'
+      - series: 'gitops_environment_state{job="node",env="staging",state="failed"}'
+        values: '0x20'
+    alert_rule_test:
+      - alertname: ObservabilityComponentDown
+        eval_time: 6m
+        exp_alerts:
+          - exp_labels: { severity: warn, job: probe-observability, component: grafana, instance: "http://grafana:3000/api/health" }
+            exp_annotations:
+              summary: "grafana is unhealthy"
+      - alertname: HostMemoryPressure
+        eval_time: 11m
+        exp_alerts:
+          - exp_labels: { severity: warn, job: node }
+            exp_annotations:
+              summary: "only 1.562% memory available"
+      - alertname: GitOpsEnvironmentUnhealthy
+        eval_time: 16m
+        exp_alerts:
+          - exp_labels: { severity: page, job: node, env: production, state: failed }
+            exp_annotations:
+              summary: "production is failed according to the GitOps agent"
+      # No agent metrics at all in this case.
+      - alertname: GitOpsAgentMetricsMissing
+        eval_time: 16m
+        exp_alerts:
+          - exp_labels: { severity: warn }
+            exp_annotations:
+              summary: "no GitOps agent metrics; agent not installed, or METRICS_DIR not mounted into node-exporter"
+
+  # --- the dead man's switch is always on ------------------------------------
+  - interval: 1m
+    alert_rule_test:
+      - alertname: Watchdog
+        eval_time: 1m
+        exp_alerts:
+          - exp_labels: { severity: none }
+            exp_annotations:
+              summary: "dead man's switch; should always be firing"

@@ -25,6 +25,7 @@ cat > "$BIN/docker" <<'EOF'
 # Minimal docker stub: records calls, tracks the running release per project.
 echo "docker $*" >> "$MOCK/calls.log"
 [[ "$1" == network ]] && exit 0
+[[ "$1" == info ]] && { echo "$MOCK"; exit 0; }   # DockerRootDir for the disk check
 [[ "$1" == compose ]] || exit 0
 shift
 project="" release=""
@@ -70,7 +71,14 @@ case "$url" in
     ratio=0.0; [[ -f "$MOCK/errors-$running" ]] && ratio=0.5
     printf '{"status":"success","data":{"result":[{"value":[0,"%s"]}]}}' "$ratio" ;;
   */ready)
-    [[ -n "$running" && ! -f "$MOCK/notready-$running" ]] || exit 22 ;;
+    [[ -n "$running" && ! -f "$MOCK/notready-$running" ]] || exit 22
+    if [[ -f "$MOCK/legacy-$running" ]]; then   # release predating per-dependency /ready
+      printf '{"status":"ready","schema":"0001"}'
+    elif [[ -f "$MOCK/noworker-$running" ]]; then
+      printf '{"status":"degraded","version":"%s","checks":{"worker":{"status":"degraded","versions":[]}}}' "$running"
+    else
+      printf '{"status":"ready","version":"%s","checks":{"worker":{"status":"ok","versions":["%s"]}}}' "$running" "$running"
+    fi ;;
   */version)
     [[ -n "$running" ]] || exit 22
     printf '{"version":"%s"}' "$running" ;;
@@ -118,6 +126,10 @@ state()   { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["stat
 check() { # check <description> <actual> <expected>
   if [[ "$2" == "$3" ]]; then PASS=$((PASS + 1)); echo "ok   - $1"
   else echo "FAIL - $1: got '$2', expected '$3'"; echo "--- agent log"; tail -30 "$WORK/agent.log"; exit 1; fi
+}
+
+metric() { # metric <name{labels}>: value from the agent's textfile metrics
+  awk -v k="$1" '$1 == k {print $2}' "$STATE/metrics/gitops.prom"
 }
 
 # --------------------------------------------------------------------------- scenarios
@@ -176,5 +188,42 @@ check "production follows verified staging release" "$(running production)" ffff
 touch "$MOCK/cicd-staging.down"
 agent
 check "drift is healed" "$([[ -f "$MOCK/cicd-staging.down" ]] && echo down || echo up)" up
+
+# --- worker-aware rollout ---------------------------------------------------
+touch "$MOCK/noworker-a7a7a7a7"
+promote a7a7a7a7 staging 7
+agent
+check "release whose worker never heartbeats is rolled back" "$(running staging)" fffffff6
+check "rollback reason names the missing worker" \
+  "$(grep -c 'no heartbeat from a a7a7a7a7 worker' "$WORK/agent.log" || true)" 1
+
+# --- rollback to a release with the legacy /ready format ---------------------
+touch "$MOCK/legacy-fffffff6"
+touch "$MOCK/errors-b8b8b8b8"
+promote b8b8b8b8 staging 8
+agent
+check "rollback to a legacy-/ready release succeeds" "$(state staging)" rolled_back
+check "legacy release is serving again" "$(running staging)" fffffff6
+
+# --- disk preflight ----------------------------------------------------------
+promote c9c9c9c9 staging 9
+MIN_FREE_DISK_MB=999999999 agent
+check "low disk blocks the deploy" "$(running staging)" fffffff6
+check "low disk status says it will retry" "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["detail"])' "$STATE/staging/status.json")" "low disk space (will retry)"
+agent
+check "deploy proceeds once disk is available (not marked bad)" "$(running staging)" c9c9c9c9
+
+# --- image pruning -------------------------------------------------------------
+check "successful deploy prunes only this app's old images" \
+  "$(grep -c 'docker image prune --all --force --filter until=168h --filter label=org.opencontainers.image.title=personal-ci-cd' "$MOCK/calls.log" || true)" 5
+
+# --- agent metrics (node-exporter textfile) -----------------------------------
+check "metrics: last run succeeded" "$(metric gitops_agent_last_run_success)" 1
+check "metrics: staging deployed state" "$(metric 'gitops_environment_state{env="staging",state="deployed"}')" 1
+check "metrics: staging rollbacks counted" "$(metric 'gitops_rollbacks_total{env="staging"}')" 4.0
+check "metrics: staging deploys counted" "$(metric 'gitops_deploys_total{env="staging"}')" 3.0
+check "metrics: drift heal counted" "$(metric 'gitops_drift_heals_total{env="staging"}')" 1.0
+check "metrics: production version exported" "$(grep -c 'gitops_environment_info{env="production",version="fffffff6"' "$STATE/metrics/gitops.prom")" 1
+check "metrics file is world-readable for node-exporter" "$(stat -c %a "$STATE/metrics/gitops.prom")" 644
 
 echo "all $PASS agent scenario checks passed"

@@ -20,6 +20,8 @@ usermod -aG docker gitops
 install -d -m 0755 /opt/gitops-agent
 install -m 0755 "$here/gitops-agent.sh" /opt/gitops-agent/gitops-agent.sh
 install -d -m 0750 -o gitops -g gitops /var/lib/gitops-agent
+# World-readable so node-exporter (bind-mounted, running as nobody) can read it.
+install -d -m 0755 -o gitops -g gitops /var/lib/gitops-agent/metrics
 install -d -m 0750 -o root -g gitops /etc/gitops-agent /etc/gitops-agent/secrets
 
 if [[ ! -f /etc/gitops-agent/agent.env ]]; then

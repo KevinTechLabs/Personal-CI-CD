@@ -5,7 +5,7 @@
 | Host | Role |
 |---|---|
 | **REACTOR** | development workstation; changes are pushed from here |
-| **AI-LAB** | runs staging (:8081), production (:8080), Prometheus (localhost:9090), Grafana (:3000) and the GitOps agent |
+| **AI-LAB** | runs staging (:8081), production (:8080), the GitOps agent, and the monitoring stack: Prometheus (localhost:9090), Alertmanager (localhost:9093), blackbox + node-exporter (internal), Grafana (:3000) |
 
 ---
 
@@ -92,15 +92,35 @@ git clone https://github.com/KevinTechLabs/Personal-CI-CD.git ~/personal-ci-cd
 cd ~/personal-ci-cd
 sudo deploy/agent/install.sh          # user, dirs, secrets, systemd timer
 
-# Prometheus + Grafana
+# Alerting (see "Set up alerts to your phone" below first)
+deploy/observability/configure-alerts.sh \
+  --ntfy https://ntfy.sh/<your-private-topic> \
+  --healthchecks https://hc-ping.com/<uuid> --test
+
+# Monitoring stack
 cp deploy/observability/grafana.env.example deploy/observability/grafana.env
 $EDITOR deploy/observability/grafana.env    # set a real password
 cd deploy/observability && docker compose --env-file grafana.env up -d
 ```
 
-Review `/etc/gitops-agent/agent.env` (optional: set `NOTIFY_URL` to an
-ntfy.sh topic for phone notifications). The installer generates a Postgres
-password per environment in `/etc/gitops-agent/secrets/`.
+Review `/etc/gitops-agent/agent.env` and set `NOTIFY_URL` to the same ntfy
+topic, so deploy and rollback events reach your phone too. The installer
+generates a Postgres password per environment in `/etc/gitops-agent/secrets/`.
+
+#### Set up alerts to your phone (about 5 minutes, free)
+
+1. **ntfy:** install the ntfy app on your phone and subscribe to a topic with
+   a long, unguessable name (e.g. `ailab-alerts-` + 12 random characters).
+   Anyone who knows the name can read it.
+2. **healthchecks.io:** create a free account and a check named `AI-LAB
+   monitoring` with **Period 1 minute, Grace 5 minutes**. Under
+   *Integrations*, add your email and/or the ntfy app. Copy the check's
+   ping URL.
+3. Run `configure-alerts.sh` with both (above). `--test` sends a test push
+   and the first ping.
+4. After `docker compose up -d`, the healthchecks.io check turns green
+   within a minute. That's the Watchdog alert arriving. If AI-LAB ever stops
+   pinging, healthchecks.io tells you.
 
 Watch it work:
 
@@ -111,7 +131,7 @@ journalctl -fu gitops-agent
 ### 7. First production deploy
 
 1. Merge to `main`. Staging deploys automatically. Check http://ai-lab:8081
-   and the Grafana dashboard.
+   and the Grafana *Platform health* dashboard.
 2. Free port 8080: `docker rm -f my-cicd-project` (the v1 container).
 3. Approve the *Promote to production* job in the workflow run.
 4. Within a minute the agent deploys production on :8080.
@@ -141,6 +161,31 @@ git log --oneline origin/environments      # full deployment history
 
 `state` is one of `deployed`, `deploying`, `waiting` (production awaiting a
 staging-verified digest), `rolled_back`, `failed`, `degraded`.
+
+### Is everything healthy?
+
+```bash
+curl -s localhost:8081/ready | python3 -m json.tool   # per-dependency report
+curl -s localhost:9093/api/v2/alerts | python3 -c 'import json,sys; [print(a["labels"]["alertname"], a["labels"].get("env","")) for a in json.load(sys.stdin)]'
+```
+
+Or open Grafana → *Personal CI/CD: Platform health*. The Watchdog alert is
+always listed (that's the dead man's switch working); anything else is real.
+
+### Silence an alert during maintenance
+
+```bash
+docker exec observability-alertmanager-1 amtool --alertmanager.url=http://localhost:9093 \
+  silence add alertname=EndpointDown env=staging --duration=1h --comment="planned work"
+```
+
+### Scheduled security scan
+
+Runs Monday and Thursday (and on demand: *Actions → Scheduled security scan →
+Run workflow*). If it finds a problem it opens one issue labeled
+`security-scan`, comments on each repeat, and closes it when a run passes.
+Usual fix: merge the Dependabot PR for the flagged package (or bump it
+yourself, `uv lock`, push) and let it flow through staging → production.
 
 ### Roll back
 
@@ -201,6 +246,15 @@ later release. See ARCHITECTURE.md §4.
 | Pull fails with `unauthorized` | GHCR package still private (setup step 3). |
 | `migration failed` | `docker compose -p cicd-<env> logs migrate`. The old release is still serving. |
 | Soak keeps rolling back | Grafana error-ratio panel; `docker compose -p cicd-<env> logs api`. |
+| Deploy rolled back: `no heartbeat from a <sha> worker` | The new worker isn't starting: `docker compose -p cicd-<env> logs worker`. |
+| `low disk space (will retry)` | `docker system df`; free space and the agent retries on its own. Lower `PRUNE_AFTER` if images pile up. |
+| `/ready` says `degraded` | Read which check: `worker` (worker down, see logs), `queue` (worker too slow or stuck), `database` (slow). Degraded still serves traffic. |
+| No push notifications | `docker compose -f deploy/observability/compose.yaml logs alertmanager`; rerun `configure-alerts.sh --test`; check the ntfy topic name on your phone. |
+| healthchecks.io says "down" | Alertmanager or Prometheus isn't running, or AI-LAB is offline: `docker compose -f deploy/observability/compose.yaml ps`. |
+| `GitOpsAgentStale` | `systemctl status gitops-agent.timer`, `journalctl -u gitops-agent -n 50`. |
+| `GitOpsAgentMetricsMissing` | Agent installed before this release: rerun `sudo deploy/agent/install.sh` (creates the metrics dir), then restart node-exporter. |
+| `DeployDependencyUnreachable` | AI-LAB can't reach GHCR / GitHub / Sigstore: check DNS, internet, Tailscale exit-node settings. |
+| `HostClockSkew` | `timedatectl`; enable NTP (`sudo timedatectl set-ntp true`). Signature checks fail on a wrong clock. |
 | `Prometheus unavailable` warnings | `docker compose -f deploy/observability/compose.yaml ps`; soak falls back to readiness-only unless `REQUIRE_PROMETHEUS=true`. |
 | CI `uv lock --check` fails | Dependencies changed without re-locking: run `uv lock` and commit. |
 | Stack logs | `docker compose -p cicd-staging logs -f api worker` |

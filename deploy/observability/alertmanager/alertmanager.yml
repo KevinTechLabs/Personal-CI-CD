@@ -1,0 +1,43 @@
+# Alert routing.
+#
+#   Watchdog       -> healthchecks.io every minute (dead man's switch: if the
+#                     pings stop because AI-LAB, Docker, Prometheus or
+#                     Alertmanager died, healthchecks.io alerts you instead)
+#   everything else -> ntfy push notification, priority by severity
+#
+# The two URLs are read from files written by configure-alerts.sh so your
+# ntfy topic and ping URL never land in Git.
+
+route:
+  receiver: ntfy
+  group_by: [alertname, env]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers: [alertname = "Watchdog"]
+      receiver: deadmans-switch
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 1m
+
+receivers:
+  - name: ntfy
+    webhook_configs:
+      - url_file: /etc/alertmanager/secrets/ntfy_url
+        send_resolved: true
+        max_alerts: 10
+
+  - name: deadmans-switch
+    webhook_configs:
+      - url_file: /etc/alertmanager/secrets/healthchecks_url
+        send_resolved: false
+
+inhibit_rules:
+  # If an environment's API is down, don't also page about its symptoms.
+  - source_matchers: [alertname = "EndpointDown"]
+    target_matchers: [alertname =~ "HighErrorRatio|ReadinessDegraded|WorkerHeartbeatStale|QueueBacklog|SlowReadinessProbe"]
+    equal: [env]
+  # A full disk explains almost everything else on the host.
+  - source_matchers: [alertname = "HostDiskAlmostFull"]
+    target_matchers: [alertname = "HostDiskWillFillSoon"]

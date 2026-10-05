@@ -11,11 +11,12 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_session
+from app.health import run_checks
 from app.metrics import HTTP_LATENCY, HTTP_REQUESTS, set_build_info
 from app.models import Task, TaskStatus
 from app.processing import MAX_PAYLOAD_CHARS
@@ -117,25 +118,14 @@ def health() -> dict:
 
 @app.get("/ready")
 def ready(response: Response, session: Session = Depends(get_session)) -> dict:
-    """Readiness: database reachable and schema at the revision we expect."""
-    try:
-        current = session.execute(
-            text("SELECT version_num FROM alembic_version")
-        ).scalar_one_or_none()
-    except Exception:  # noqa: BLE001 - any DB failure means not ready
-        response.status_code = 503
-        return {"status": "not_ready", "reason": "database unavailable"}
+    """Readiness with a per-dependency report (see app/health.py).
 
-    expected = expected_schema_revision()
-    if current != expected:
-        response.status_code = 503
-        return {
-            "status": "not_ready",
-            "reason": "schema revision mismatch",
-            "database": current,
-            "expected": expected,
-        }
-    return {"status": "ready", "schema": current}
+    503 only when a critical dependency (database, schema) fails; worker or
+    queue problems report "degraded" but keep serving.
+    """
+    code, body = run_checks(session, settings, expected_schema_revision())
+    response.status_code = code
+    return body
 
 
 @app.get("/version")

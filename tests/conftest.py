@@ -57,7 +57,7 @@ def db_session(migrated_db):
     from app.db import get_sessionmaker
 
     session = get_sessionmaker()()
-    session.execute(text("TRUNCATE tasks RESTART IDENTITY"))
+    session.execute(text("TRUNCATE tasks, worker_heartbeats RESTART IDENTITY"))
     session.commit()
     try:
         yield session

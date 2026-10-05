@@ -14,6 +14,10 @@ class Settings:
     worker_poll_seconds: float
     worker_metrics_port: int
     worker_heartbeat_file: str
+    worker_heartbeat_interval: float
+    worker_stale_seconds: float
+    queue_max_age_seconds: float
+    db_latency_budget_ms: float
 
 
 def get_settings() -> Settings:
@@ -32,4 +36,9 @@ def get_settings() -> Settings:
             "WORKER_HEARTBEAT_FILE",
             "/tmp/worker-heartbeat",  # noqa: S108  # nosec B108 - tmpfs, read-only container
         ),
+        # Readiness thresholds (see app/health.py).
+        worker_heartbeat_interval=float(os.environ.get("WORKER_HEARTBEAT_INTERVAL", "5")),
+        worker_stale_seconds=float(os.environ.get("WORKER_STALE_SECONDS", "30")),
+        queue_max_age_seconds=float(os.environ.get("QUEUE_MAX_AGE_SECONDS", "300")),
+        db_latency_budget_ms=float(os.environ.get("DB_LATENCY_BUDGET_MS", "250")),
     )

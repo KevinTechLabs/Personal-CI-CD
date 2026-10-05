@@ -15,10 +15,12 @@ def test_health_is_dependency_free(client):
     assert client.get("/health").json() == {"status": "healthy"}
 
 
-def test_ready_when_schema_current(client):
-    response = client.get("/ready")
-    assert response.status_code == 200
-    assert response.json()["status"] == "ready"
+def test_ready_reports_every_dependency(client):
+    body = client.get("/ready").json()
+    assert set(body["checks"]) == {"database", "schema", "worker", "queue"}
+    assert body["checks"]["database"]["status"] == "ok"
+    assert body["checks"]["schema"]["status"] == "ok"
+    assert body["version"] == "test-sha"
 
 
 def test_ready_fails_on_schema_mismatch(client, db_session):
@@ -28,7 +30,13 @@ def test_ready_fails_on_schema_mismatch(client, db_session):
     try:
         response = client.get("/ready")
         assert response.status_code == 503
-        assert response.json()["reason"] == "schema revision mismatch"
+        body = response.json()
+        assert body["status"] == "not_ready"
+        assert body["checks"]["schema"] == {
+            "status": "fail",
+            "current": "stale",
+            "expected": current,
+        }
     finally:
         db_session.execute(text("UPDATE alembic_version SET version_num = :v"), {"v": current})
         db_session.commit()
@@ -72,5 +80,5 @@ def test_chaos_injection_spares_probes(client, monkeypatch):
     monkeypatch.setenv("CHAOS_ERROR_RATE", "1")
     assert client.get("/api/tasks").status_code == 500
     assert client.get("/health").status_code == 200
-    assert client.get("/ready").status_code == 200
+    assert client.get("/ready").status_code == 200  # degraded (no worker), not failed
     assert client.get("/version").status_code == 200

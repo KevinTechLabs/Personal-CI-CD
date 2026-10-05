@@ -44,5 +44,17 @@ for ((i = 0; i < TIMEOUT; i++)); do
 done
 [[ "$status" == "done" ]] || fail "task $task_id still '$status' after ${TIMEOUT}s"
 
+# Every dependency check should now be green, and the worker that just
+# processed our task should be heartbeating with the expected version.
+ready="$(curl -fsS "$BASE/ready")"
+overall="$(json '["status"]' <<<"$ready")"
+[[ "$overall" == "ready" ]] || fail "/ready is '$overall': $ready"
+if [[ -n "$EXPECTED_VERSION" ]]; then
+  json '["checks"]["worker"]["versions"]' <<<"$ready" | grep -q "$EXPECTED_VERSION" \
+    || fail "no worker heartbeat from version $EXPECTED_VERSION: $ready"
+fi
+echo "smoke: all dependency checks ok"
+
 curl -fsS "$BASE/metrics" | grep -q '^http_requests_total' || fail "/metrics missing request counter"
+curl -fsS "$BASE/metrics" | grep -q '^readiness_check_state' || fail "/metrics missing readiness gauges"
 echo "smoke: PASS"

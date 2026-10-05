@@ -1,31 +1,99 @@
-# Observability stack: Prometheus + Grafana, shared by both environments.
-# Run once on AI-LAB (not managed by the GitOps agent):
+# Observability stack, shared by both environments. Run once on AI-LAB (not
+# managed by the GitOps agent):
 #
-#   docker network create observability   # if the agent hasn't already
+#   deploy/observability/configure-alerts.sh   # once: ntfy + dead man's switch
 #   cd deploy/observability && docker compose --env-file grafana.env up -d
 #
-# Prometheus is bound to localhost: the GitOps agent queries it for the
-# rollback SLO check. Grafana is on the LAN at http://ai-lab:3000.
+# What watches what:
+#
+#   prometheus      scrapes everything below, evaluates SLO + alert rules
+#   alertmanager    routes alerts to your phone (ntfy) and pings an external
+#                   dead man's switch (healthchecks.io) every minute, so you
+#                   hear about it even if AI-LAB itself goes down
+#   blackbox        probes app endpoints like a user would, plus the external
+#                   services the deploy path depends on (GHCR, GitHub, Sigstore)
+#   node-exporter   host disk, memory, CPU, clock skew; also publishes the
+#                   GitOps agent's own metrics (textfile collector)
+#   grafana         dashboards, LAN only on :3000
+#
+# Prometheus and Alertmanager listen on localhost only (the GitOps agent uses
+# Prometheus for its rollback SLO check). Everything else is internal.
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  networks: [observability]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
 
 services:
   prometheus:
+    <<: *hardening
     image: prom/prometheus:v3.15.0
-    restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.time=30d
+      - --storage.tsdb.retention.size=5GB
       - --web.enable-lifecycle
     volumes:
       - ./prometheus:/etc/prometheus:ro
       - prometheus-data:/prometheus
     ports:
       - "127.0.0.1:9090:9090"
-    networks: [observability]
-    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  alertmanager:
+    <<: *hardening
+    image: prom/alertmanager:v0.34.1
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # Written by configure-alerts.sh; contains your ntfy topic and
+      # healthchecks.io ping URL. Never committed (see .gitignore).
+      - ./secrets:/etc/alertmanager/secrets:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9093/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  blackbox:
+    <<: *hardening
+    image: prom/blackbox-exporter:v0.28.0
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    read_only: true
+    cap_drop: [ALL]
+
+  node-exporter:
+    <<: *hardening
+    image: prom/node-exporter:v1.12.1
+    command:
+      - --path.rootfs=/host
+      - --collector.textfile.directory=/textfile
+      # Skip container/virtual filesystems so disk alerts reflect real disks.
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+)($|/)
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+      - /var/lib/gitops-agent/metrics:/textfile:ro
+    read_only: true
+    cap_drop: [ALL]
 
   grafana:
+    <<: *hardening
     image: grafana/grafana:13.2.2
-    restart: unless-stopped
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?create grafana.env}
@@ -38,11 +106,10 @@ services:
     ports:
       - "3000:3000"
     depends_on: [prometheus]
-    networks: [observability]
-    security_opt: ["no-new-privileges:true"]
 
 volumes:
   prometheus-data:
+  alertmanager-data:
   grafana-data:
 
 networks:

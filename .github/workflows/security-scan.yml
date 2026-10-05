@@ -1,0 +1,190 @@
+name: Scheduled security scan
+
+# The pipeline scans each image once, at build time. Vulnerabilities are
+# disclosed every day, though, so this re-checks what is *actually deployed*
+# (the digests on the `environments` branch) and the dependency lockfile on a
+# schedule, and keeps one GitHub issue open while anything is wrong.
+#
+#   deployed images   Trivy (OS + Python packages), signature still verifies
+#   lockfile          pip-audit against the vulnerability database,
+#                     plus a freshness report of outdated dependencies
+
+on:
+  schedule:
+    - cron: "23 13 * * 1,4" # Mon + Thu, 06:23 Pacific
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: security-scan
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.14"
+  ISSUE_LABEL: security-scan
+
+jobs:
+  # ---------------------------------------------------------------------------
+  targets:
+    name: Find deployed images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+      any: ${{ steps.find.outputs.any }}
+    steps:
+      - name: Read the environments branch
+        id: find
+        env:
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+        run: |
+          if git clone --quiet --depth 1 --branch environments "$SERVER/$REPO.git" envs 2>/dev/null; then
+            python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, pathlib
+          include = []
+          for release in sorted(pathlib.Path("envs").glob("*/release.env")):
+              values = dict(
+                  line.split("=", 1) for line in release.read_text().splitlines()
+                  if "=" in line and not line.startswith("#")
+              )
+              include.append({"env": release.parent.name,
+                              "image": values["APP_IMAGE"],
+                              "version": values["APP_VERSION"][:12]})
+          print("matrix=" + json.dumps({"include": include}))
+          print("any=" + ("true" if include else "false"))
+          PY
+          else
+            echo "No environments branch yet; nothing deployed to scan."
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  deployed:
+    name: Deployed image (${{ matrix.env }})
+    needs: targets
+    if: needs.targets.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    steps:
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      - name: Signature still verifies
+        env:
+          IMAGE: ${{ matrix.image }}
+          IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/pipeline.yml@refs/heads/main
+        run: |
+          cosign verify --output text \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "$IDENTITY" "$IMAGE" >/dev/null
+          echo "Signature OK for \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Trivy (SARIF to code scanning)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.74.0
+          image-ref: ${{ matrix.image }}
+          format: sarif
+          output: trivy.sarif
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        if: always() && hashFiles('trivy.sarif') != ''
+        with:
+          sarif_file: trivy.sarif
+          category: deployed-${{ matrix.env }}
+
+      - name: Trivy gate (fixable CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.74.0
+          image-ref: ${{ matrix.image }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          skip-setup-trivy: true
+
+  # ---------------------------------------------------------------------------
+  lockfile:
+    name: Dependency audit + freshness
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Outdated dependencies (informational)
+        run: |
+          uv sync --locked --quiet
+          {
+            echo "### Outdated direct dependencies"
+            echo '```'
+            uv tree --outdated --depth 1 --no-dev | grep -E 'latest' || echo "all direct dependencies are current"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: pip-audit (known vulnerabilities)
+        run: |
+          uv export --locked --no-dev --no-emit-project --format requirements-txt -o /tmp/requirements.txt
+          uv run pip-audit --strict --disable-pip --require-hashes -r /tmp/requirements.txt
+
+  # ---------------------------------------------------------------------------
+  report:
+    name: Open / close tracking issue
+    needs: [targets, deployed, lockfile]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Update the security-scan issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TARGETS: ${{ needs.targets.result }}
+          DEPLOYED: ${{ needs.deployed.result }}
+          LOCKFILE: ${{ needs.lockfile.result }}
+        run: |
+          existing="$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq '.[0].number // empty')"
+          failed=()
+          [[ "$TARGETS"  == "failure" ]] && failed+=("could not read deployed releases")
+          [[ "$DEPLOYED" == "failure" ]] && failed+=("deployed image: fixable CRITICAL/HIGH vulnerability or invalid signature")
+          [[ "$LOCKFILE" == "failure" ]] && failed+=("Python dependency with a known vulnerability")
+
+          if ((${#failed[@]})); then
+            body="$(printf -- '- %s\n' "${failed[@]}")"
+            body+=$'\n\n'"Details: $RUN_URL"
+            body+=$'\n'"Findings also appear under Security → Code scanning (categories \`deployed-*\`)."
+            if [[ -n "$existing" ]]; then
+              gh issue comment "$existing" --body "Still failing:"$'\n'"$body"
+            else
+              gh label create "$ISSUE_LABEL" --color B60205 \
+                --description "Opened by the scheduled security scan" --force
+              gh issue create --label "$ISSUE_LABEL" \
+                --title "Scheduled security scan: action needed" --body "$body"
+            fi
+            exit 1
+          elif [[ -n "$existing" ]]; then
+            gh issue close "$existing" --comment "Resolved: $RUN_URL passed."
+          fi
+          echo "All scheduled security checks passed." >> "$GITHUB_STEP_SUMMARY"

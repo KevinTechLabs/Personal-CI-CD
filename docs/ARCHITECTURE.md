@@ -28,19 +28,36 @@ tasks and asserts each is processed exactly once.
 
 - `/health`: *liveness*. The process is up. It never touches the database,
   so a DB outage doesn't make Docker restart healthy API containers in a loop.
-- `/ready`: *readiness*. The database is reachable **and** its Alembic revision
-  equals the head this build expects. That catches "new code, old schema".
-- `/version`: which commit is running. The agent requires this to match the
-  release it just deployed, which proves the *new* containers are the ones
-  answering (v1's README verified this by hand).
+- `/ready`: *readiness*, with a per-dependency report (`app/health.py`):
+
+  | check | ok when | on failure |
+  |---|---|---|
+  | `database` | `SELECT 1` answers within 250ms | **fail → 503** (slow → degraded) |
+  | `schema` | Alembic revision = the head this build expects | **fail → 503** |
+  | `worker` | a heartbeat younger than 30s; lists live worker versions | degraded, still 200 |
+  | `queue` | oldest pending task younger than 5 min | degraded, still 200 |
+
+  Only *critical* checks take an instance out of service. A stuck worker
+  doesn't stop the API accepting tasks, so it reports `degraded` instead,
+  which is visible to people (Grafana, alerts) and to the GitOps agent.
+- `/version`: which commit is running.
+
+**Worker heartbeats.** The worker can't be probed over HTTP by the API, so
+every 5s it upserts a row in `worker_heartbeats` (ID, version, last seen,
+tasks processed) and deletes it on clean shutdown. `/ready` reads those rows.
+That is what lets the agent require *a worker running the new version* before
+it declares a deploy successful: a release whose worker crash-loops is
+rolled back even though its API looks perfect. Rows left by killed workers
+age out of the check after 30s and are pruned after 24h.
 
 ## 2. The pipeline
 
 `.github/workflows/pipeline.yml`, least-privilege permissions per job:
 
 1. **quality**: lockfile freshness, Ruff, Bandit, pip-audit against the
-   hashed lock, ShellCheck, Compose validation, the GitOps agent scenario
-   tests, TruffleHog over full history.
+   hashed lock, ShellCheck, actionlint, Compose validation, the GitOps agent
+   scenario tests, Prometheus/Alertmanager/blackbox config checks and
+   `promtool` alert-rule unit tests, TruffleHog over full history.
 2. **test**: pytest against a Postgres 18 service container, 80% coverage
    gate. `REQUIRE_DATABASE=1` turns a missing DB into an error, so integration
    tests can never be skipped silently.
@@ -104,16 +121,20 @@ fetch environments ─▶ tree hash changed?
         ─▶ production: digest must be in staging's verified list on this host
         ─▶ cosign verify signature + SBOM attestation (identity = this repo's
            pipeline.yml on refs/heads/main)
+        ─▶ disk preflight (MIN_FREE_DISK_MB); retried later, not marked bad
         ─▶ pull images
         ─▶ run migrations while the OLD release keeps serving
              fail ─▶ stop; nothing was replaced
         ─▶ replace api + worker
-        ─▶ wait for /ready and /version == APP_VERSION
+        ─▶ wait for /ready = 200, /version == APP_VERSION, and APP_VERSION
+           in /ready's live worker versions
+             fail ─▶ roll back (the reason names the failing check)
+        ─▶ soak: synthetic traffic + readiness + new worker still alive +
+           Prometheus env:http_error_ratio:rate2m ≤ MAX_ERROR_RATIO
              fail ─▶ roll back
-        ─▶ soak: synthetic traffic + readiness + Prometheus
-           env:http_error_ratio:rate2m ≤ MAX_ERROR_RATIO
-             fail ─▶ roll back
-        ─▶ record as applied; staging adds digest to verified list
+        ─▶ record as applied; staging adds digest to verified list;
+           prune this app's images unused for 7 days
+        ─▶ every run: write agent metrics for node-exporter
 ```
 
 A rolled-back revision is recorded in `failed.rev` so the agent doesn't
@@ -141,22 +162,67 @@ previous release is, by construction, compatible with the new schema.
 `tests/test_migrations.py` enforces a single Alembic head and a clean
 downgrade/upgrade round trip.
 
-## 5. Observability
+## 5. Observability and alerting
 
 `deploy/observability/` runs Prometheus and Grafana on a shared Docker
 network called `observability`. Each environment's `api` and `worker` join
 it with the aliases `api-<env>` / `worker-<env>`, so one Prometheus scrapes
 both environments with an `env` label.
 
+Watching from four angles:
+
+| Layer | Source | Example alerts |
+|---|---|---|
+| Is it serving? | blackbox probes `/ready` like a user | `EndpointDown`, `SlowReadinessProbe` |
+| Are its dependencies OK? | `readiness_check_*` gauges from `/ready` | `ReadinessDegraded`, `WorkerHeartbeatStale`, `QueueBacklog` |
+| Can we still deploy? | blackbox probes GHCR, GitHub, Sigstore; agent metrics | `DeployDependencyUnreachable`, `GitOpsAgentStale`, `GitOpsEnvironmentUnhealthy`, `GitOpsRolledBack` |
+| Is the host OK? | node-exporter | `HostDiskAlmostFull`, `HostDiskWillFillSoon`, `HostMemoryPressure`, `HostClockSkew` |
+
+`HostClockSkew` exists because cosign checks certificate validity windows: a
+drifting clock makes perfectly valid images fail verification.
+
+**The GitOps agent reports on itself.** Each run writes
+`/var/lib/gitops-agent/metrics/gitops.prom` (last run time, state per
+environment, deploys, rollbacks, drift heals), which node-exporter's textfile
+collector serves. If the timer dies, `GitOpsAgentStale` fires.
+
+**Who watches the watcher?** Everything above runs on AI-LAB, so if AI-LAB
+loses power, nothing on it can alert. The `Watchdog` alert is always firing;
+Alertmanager forwards it to healthchecks.io every minute. When the pings
+stop, healthchecks.io (off-site) notifies you. That's the dead man's switch.
+
+**Routing.** Alertmanager sends `page` alerts to ntfy at max priority and
+`warn` at normal priority, with resolved notices. Inhibition rules keep one
+outage to one notification (e.g. `EndpointDown` suppresses that
+environment's symptom alerts). Every alert has a `promtool` unit test in
+`tests/monitoring/rules_test.yml`, so rule changes can't silently break
+alerting.
+
+Other details:
+
 - Recording rules precompute the error ratio (the rollback SLO) and p95 latency.
-- Alerts: `HighErrorRatio`, `TargetDown`, `QueueBacklog`.
-- The Grafana dashboard shows the deployed version per environment and
-  annotates every version change.
+- Two Grafana dashboards: *Service overview* (traffic, errors, latency,
+  queue, deploy annotations) and *Platform health* (probes, dependency
+  checks, external deps, agent, host).
 - HTTP metrics use route templates (`/api/tasks/{task_id}`), not raw paths,
   to keep label cardinality bounded. Probe and scrape endpoints are excluded
   so they don't dilute the SLO.
 
-## 6. Security model and trade-offs
+## 6. Continuous dependency checking
+
+Build-time scans only describe the day an image was built. The
+`security-scan` workflow (Mon/Thu) reads the digests actually deployed from
+the `environments` branch and, for each one, re-verifies its signature and
+runs Trivy, uploading findings to code scanning (`deployed-staging`,
+`deployed-production`). It also pip-audits the lockfile and writes an
+outdated-dependency report to the run summary. A single GitHub issue labeled
+`security-scan` opens on failure, gets a comment on each repeat, and closes
+itself when a run passes. Fixing it is the normal flow: Dependabot (or you)
+bumps the dependency → pipeline → staging → approve.
+
+OpenSSF Scorecard grades the repository's own supply-chain hygiene weekly.
+
+## 7. Security model and trade-offs
 
 - **The docker group is root-equivalent.** The agent runs as a dedicated
   `gitops` user in that group under a hardened systemd unit. That's the

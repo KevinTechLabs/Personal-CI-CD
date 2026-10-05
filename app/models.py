@@ -43,3 +43,20 @@ class Task(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WorkerHeartbeat(Base):
+    """One row per worker process, refreshed every few seconds.
+
+    Lets the API (and through it, the GitOps agent) see which worker
+    versions are alive without being able to reach the worker directly.
+    """
+
+    __tablename__ = "worker_heartbeats"
+
+    worker_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    version: Mapped[str] = mapped_column(String(64), nullable=False)
+    environment: Mapped[str] = mapped_column(String(32), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    tasks_processed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

@@ -1,0 +1,32 @@
+# Blackbox exporter modules. Prometheus decides *what* to probe
+# (prometheus/prometheus.yml); these define *how*.
+modules:
+  # App endpoints on the internal Docker network. /ready answers 200 when
+  # serving (ready or degraded) and 503 when a critical dependency is down.
+  http_ready:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      valid_status_codes: [200]
+      preferred_ip_protocol: ip4
+      fail_if_body_not_matches_regexp:
+        - '"status":\s*"(ready|degraded)"'
+
+  # Internal health endpoints of the monitoring stack itself.
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      preferred_ip_protocol: ip4
+
+  # External services the deploy path depends on. GHCR answers 401 to an
+  # anonymous /v2/ request, which still proves it is up and reachable.
+  http_external:
+    prober: http
+    timeout: 10s
+    http:
+      valid_status_codes: [200, 401]
+      follow_redirects: true
+      preferred_ip_protocol: ip4
+      fail_if_not_ssl: true

@@ -9,13 +9,17 @@
 #   1. refuses production digests that have not first passed on staging here
 #   2. verifies the image's Sigstore signature and SBOM attestation
 #   3. pulls, then runs database migrations while the old release still serves
-#   4. replaces the app containers and waits for /ready + the expected version
-#   5. soaks: sends synthetic traffic and watches the error-ratio SLO in
-#      Prometheus; on breach (or failed readiness) it rolls back to the last
-#      good release and remembers the bad revision so it won't retry it
+#   4. checks the host has enough free disk for the new images
+#   5. replaces the app containers and waits until /ready passes, the API
+#      reports the new version, AND a worker running the new version is
+#      heartbeating (so a crash-looping worker can't slip through)
+#   6. soaks: sends synthetic traffic and watches readiness, the worker
+#      heartbeat and the error-ratio SLO in Prometheus; on any failure it rolls
+#      back to the last good release and remembers the bad revision
 #
-# It also self-heals drift: if the applied release's containers are not
-# running, it brings them back.
+# It also self-heals drift (restarts the applied release if its containers
+# stop), prunes old release images, and exports its own metrics through the
+# node-exporter textfile collector so Prometheus can alert if it stops running.
 #
 # Run by systemd (deploy/agent/gitops-agent.timer). Config: agent.env.
 
@@ -42,6 +46,10 @@ REQUIRE_SBOM_ATTESTATION="${REQUIRE_SBOM_ATTESTATION:-true}"
 COSIGN_ISSUER="${COSIGN_ISSUER:-https://token.actions.githubusercontent.com}"
 COSIGN_IDENTITY_REGEXP="${COSIGN_IDENTITY_REGEXP:-}"
 NOTIFY_URL="${NOTIFY_URL:-}"
+MIN_FREE_DISK_MB="${MIN_FREE_DISK_MB:-2048}"
+PRUNE_IMAGES="${PRUNE_IMAGES:-true}"
+PRUNE_AFTER="${PRUNE_AFTER:-168h}"
+METRICS_DIR="${METRICS_DIR:-$STATE_DIR/metrics}"
 
 REPO_DIR="$STATE_DIR/repo"
 VERIFIED_DIGESTS="$STATE_DIR/verified-digests"
@@ -50,9 +58,20 @@ log()  { printf '%s [%s] %s\n' "$(date -u +%FT%TZ)" "${CURRENT_ENV:-agent}" "$*"
 warn() { log "WARN: $*" >&2; }
 
 notify() {
-  # Optional: any webhook that accepts a plain-text POST (e.g. ntfy.sh topic).
+  # notify <priority> <message>. Any webhook accepting a plain-text POST works;
+  # the Title/Priority/Tags headers are understood by ntfy and ignored elsewhere.
+  local priority="$1"; shift
   [[ -n "$NOTIFY_URL" ]] || return 0
-  curl -fsS -m 10 -d "[$HOSTNAME/${CURRENT_ENV:-agent}] $*" "$NOTIFY_URL" >/dev/null || warn "notify failed"
+  curl -fsS -m 10 \
+    -H "Title: gitops ${CURRENT_ENV:-agent} on $HOSTNAME" \
+    -H "Priority: $priority" \
+    -H "Tags: rocket" \
+    -d "$*" "$NOTIFY_URL" >/dev/null || warn "notify failed"
+}
+
+bump() { # bump <file>: increment a persisted counter
+  local n; n="$(cat "$1" 2>/dev/null || echo 0)"
+  echo $((n + 1)) > "$1"
 }
 
 # Read one KEY=value from an env file without executing it.
@@ -113,17 +132,39 @@ verify_image() {
   log "signature and SBOM attestation verified"
 }
 
+readiness() {
+  # readiness <port> <version>: prints "ok" or the reason the release isn't
+  # ready yet. Understands both /ready formats so rolling back to a release
+  # that predates the per-dependency report still works.
+  local port="$1" want="$2" body api_version
+  body="$(curl -fsS -m 3 "http://127.0.0.1:$port/ready" 2>/dev/null)" || { echo "/ready not 200"; return; }
+  api_version="$(curl -fsS -m 3 "http://127.0.0.1:$port/version" 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || true)"
+  python3 - "$body" "$want" "$api_version" <<'PY'
+import json, sys
+body, want, api_version = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3]
+if api_version != want:
+    print(f"API reports version {api_version or '?'}, want {want[:12]}")
+elif "checks" not in body:
+    print("ok")  # legacy /ready: HTTP 200 + version match is all it can say
+else:
+    worker = body["checks"].get("worker", {})
+    if want not in worker.get("versions", []):
+        live = ",".join(v[:12] for v in worker.get("versions", [])) or "none"
+        print(f"no heartbeat from a {want[:12]} worker (live: {live})")
+    else:
+        print("ok")
+PY
+}
+
 wait_ready() {
-  # Ready = /ready is 200 and /version reports the release we just deployed.
-  local port="$1" want_version="$2" deadline=$((SECONDS + READY_TIMEOUT)) got
+  local port="$1" want_version="$2" deadline=$((SECONDS + READY_TIMEOUT)) why=""
   while ((SECONDS < deadline)); do
-    if curl -fsS -m 3 "http://127.0.0.1:$port/ready" >/dev/null 2>&1; then
-      got="$(curl -fsS -m 3 "http://127.0.0.1:$port/version" 2>/dev/null \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || true)"
-      [[ "$got" == "$want_version" ]] && return 0
-    fi
+    why="$(readiness "$port" "$want_version")"
+    [[ "$why" == "ok" ]] && return 0
     sleep 2
   done
+  warn "not ready: $why"
   return 1
 }
 
@@ -151,13 +192,15 @@ synthetic_traffic() {
 }
 
 soak() {
-  # Watch the new release; return non-zero on SLO breach or readiness loss.
-  local env="$1" port="$2" deadline=$((SECONDS + SOAK_SECONDS)) ratio
+  # Watch the new release; return non-zero on SLO breach, readiness loss or
+  # the new worker's heartbeat disappearing.
+  local env="$1" port="$2" version="$3" deadline=$((SECONDS + SOAK_SECONDS)) ratio why
   log "soaking for ${SOAK_SECONDS}s (max error ratio $MAX_ERROR_RATIO)"
   while ((SECONDS < deadline)); do
     synthetic_traffic "$port"
-    if ! curl -fsS -m 3 "http://127.0.0.1:$port/ready" >/dev/null 2>&1; then
-      warn "readiness lost during soak"
+    why="$(readiness "$port" "$version")"
+    if [[ "$why" != "ok" ]]; then
+      warn "readiness lost during soak: $why"
       return 1
     fi
     ratio="$(error_ratio "$env")"
@@ -185,6 +228,7 @@ rollback() {
   local applied="$STATE_DIR/$env/applied"
   warn "rolling back: $reason"
   echo "$rev" > "$STATE_DIR/$env/failed.rev"
+  bump "$STATE_DIR/$env/rollbacks_total"
   if [[ -f "$applied/release.env" ]]; then
     local prev_version port
     prev_version="$(env_value "$applied/release.env" APP_VERSION)"
@@ -193,29 +237,55 @@ rollback() {
     if wait_ready "$port" "$prev_version"; then
       log "rolled back to ${prev_version:0:12}"
       write_status "$env" rolled_back "$reason" "$prev_version"
-      notify "ROLLED BACK ${version:0:12} -> ${prev_version:0:12}: $reason"
+      notify high "ROLLED BACK ${version:0:12} -> ${prev_version:0:12}: $reason"
     else
       warn "previous release ${prev_version:0:12} is not ready either; manual attention needed"
       write_status "$env" degraded "rollback target not ready: $reason" "$prev_version"
-      notify "DEGRADED: rollback to ${prev_version:0:12} not ready ($reason)"
+      notify urgent "DEGRADED: rollback to ${prev_version:0:12} not ready ($reason)"
     fi
   else
     # First-ever deploy failed: nothing to go back to. Stop the broken app
     # (keep the database volume) rather than leave it serving errors.
     compose "$env" "$STATE_DIR/$env/incoming" stop api worker || true
     write_status "$env" failed "first deploy failed, app stopped: $reason" "$version"
-    notify "FAILED first deploy of ${version:0:12}: $reason"
+    notify urgent "FAILED first deploy of ${version:0:12}: $reason"
   fi
 }
 
+disk_preflight() {
+  # Refuse to start a deploy that would fill the disk mid-pull. Not recorded
+  # as a bad revision: it will retry once space is freed.
+  local root free_mb
+  root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)"
+  free_mb="$(df -Pm "$root" 2>/dev/null | awk 'NR==2 {print $4}')"
+  [[ -n "$free_mb" ]] || return 0
+  if ((free_mb < MIN_FREE_DISK_MB)); then
+    warn "only ${free_mb}MB free on $root (need $MIN_FREE_DISK_MB); not deploying"
+    return 1
+  fi
+}
+
+prune_images() {
+  # Remove this app's images unused for PRUNE_AFTER. Images of running
+  # containers are never removed, and rolling back to a pruned release simply
+  # re-pulls it by digest.
+  [[ "$PRUNE_IMAGES" == "true" ]] || return 0
+  docker image prune --all --force \
+    --filter "until=$PRUNE_AFTER" \
+    --filter "label=org.opencontainers.image.title=personal-ci-cd" >/dev/null \
+    || warn "image prune failed"
+}
+
 heal_drift() {
-  local env="$1" applied="$STATE_DIR/$env/applied" running
+  local env="$1"
+  local applied="$STATE_DIR/$env/applied" running
   [[ -f "$applied/release.env" ]] || return 0
   running="$(compose "$env" "$applied" ps --status running --services 2>/dev/null | sort | tr '\n' ' ')"
   if [[ "$running" != *"api"* || "$running" != *"db"* || "$running" != *"worker"* ]]; then
     warn "drift: running services are [${running}]; restoring applied release"
     compose "$env" "$applied" up -d --remove-orphans db api worker
-    notify "healed drift (running: ${running:-none})"
+    bump "$STATE_DIR/$env/drift_heals_total"
+    notify high "healed drift (running: ${running:-none})"
   fi
 }
 
@@ -267,7 +337,13 @@ reconcile_env() {
     warn "signature verification FAILED for $image"
     echo "$rev" > "$dir/failed.rev"
     write_status "$env" failed "signature verification failed" "$version"
-    notify "REFUSED ${version:0:12}: signature verification failed"
+    notify urgent "REFUSED ${version:0:12}: signature verification failed"
+    return 1
+  fi
+
+  if ! disk_preflight; then
+    write_status "$env" failed "low disk space (will retry)" "$version"
+    notify high "BLOCKED ${version:0:12}: low disk space on $HOSTNAME"
     return 1
   fi
 
@@ -290,7 +366,7 @@ reconcile_env() {
     warn "migration failed; current release left untouched"
     echo "$rev" > "$dir/failed.rev"
     write_status "$env" failed "migration failed; previous release still serving" "$version"
-    notify "FAILED ${version:0:12}: migration failed, previous release untouched"
+    notify high "FAILED ${version:0:12}: migration failed, previous release untouched"
     return 1
   fi
 
@@ -303,7 +379,7 @@ reconcile_env() {
     rollback "$env" "not ready within ${READY_TIMEOUT}s" "$rev" "$version"
     return 1
   fi
-  if ! soak "$env" "$port"; then
+  if ! soak "$env" "$port" "$version"; then
     rollback "$env" "failed post-deploy soak" "$rev" "$version"
     return 1
   fi
@@ -315,12 +391,77 @@ reconcile_env() {
   if [[ "$env" == "staging" ]]; then
     grep -qxF "$image" "$VERIFIED_DIGESTS" 2>/dev/null || echo "$image" >> "$VERIFIED_DIGESTS"
   fi
+  bump "$dir/deploys_total"
+  date +%s > "$dir/last_deploy"
+  prune_images
   log "deployed ${version:0:12}"
   write_status "$env" deployed "" "$version"
-  notify "deployed ${version:0:12}"
+  notify default "deployed ${version:0:12}"
+}
+
+write_metrics() {
+  # Export agent state for Prometheus via node-exporter's textfile collector.
+  # Written atomically (tmp + rename) so a scrape never sees half a file.
+  local rc="$1" started="$2"
+  mkdir -p "$METRICS_DIR"
+  python3 - "$STATE_DIR" "$ENVIRONMENTS" "$rc" "$started" > "$METRICS_DIR/gitops.prom.$$" <<'PY'
+import json, os, sys, time
+state_dir, envs, rc, started = sys.argv[1], sys.argv[2].split(), int(sys.argv[3]), float(sys.argv[4])
+states = ["deployed", "deploying", "waiting", "rolled_back", "failed", "degraded"]
+
+def read(path, default=0.0):
+    try:
+        return float(open(path).read().strip())
+    except (OSError, ValueError):
+        return default
+
+def esc(v):
+    return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+out = []
+def metric(name, help_, type_, samples):
+    out.append(f"# HELP {name} {help_}")
+    out.append(f"# TYPE {name} {type_}")
+    for labels, value in samples:
+        lbl = ",".join(f'{k}="{esc(v)}"' for k, v in labels.items())
+        out.append(f"{name}{{{lbl}}} {value}" if lbl else f"{name} {value}")
+
+now = time.time()
+metric("gitops_agent_last_run_timestamp_seconds", "When the agent last finished a run", "gauge", [({}, now)])
+metric("gitops_agent_last_run_success", "1 if every environment reconciled cleanly", "gauge", [({}, int(rc == 0))])
+metric("gitops_agent_last_run_duration_seconds", "Duration of the last run", "gauge", [({}, round(now - started, 3))])
+
+state_s, info_s, deploy_ts, deploys, rollbacks, heals = [], [], [], [], [], []
+for env in envs:
+    d = os.path.join(state_dir, env)
+    try:
+        status = json.load(open(os.path.join(d, "status.json")))
+    except (OSError, ValueError):
+        status = {}
+    current = status.get("state", "")
+    for s in states:
+        state_s.append(({"env": env, "state": s}, int(s == current)))
+    if status.get("version"):
+        info_s.append(({"env": env, "version": status["version"], "detail": status.get("detail", "")}, 1))
+    deploy_ts.append(({"env": env}, read(os.path.join(d, "last_deploy"))))
+    deploys.append(({"env": env}, read(os.path.join(d, "deploys_total"))))
+    rollbacks.append(({"env": env}, read(os.path.join(d, "rollbacks_total"))))
+    heals.append(({"env": env}, read(os.path.join(d, "drift_heals_total"))))
+
+metric("gitops_environment_state", "Current reconcile state per environment", "gauge", state_s)
+metric("gitops_environment_info", "Version the agent last acted on", "gauge", info_s)
+metric("gitops_last_deploy_timestamp_seconds", "When the last successful deploy finished", "gauge", deploy_ts)
+metric("gitops_deploys_total", "Successful deploys", "counter", deploys)
+metric("gitops_rollbacks_total", "Automatic rollbacks", "counter", rollbacks)
+metric("gitops_drift_heals_total", "Times the applied release was restarted after drift", "counter", heals)
+print("\n".join(out))
+PY
+  chmod 0644 "$METRICS_DIR/gitops.prom.$$"
+  mv -f "$METRICS_DIR/gitops.prom.$$" "$METRICS_DIR/gitops.prom"
 }
 
 main() {
+  local started; started="$(date +%s)"
   mkdir -p "$STATE_DIR"
   exec 9>"$STATE_DIR/lock"
   if ! flock -n 9; then
@@ -329,13 +470,15 @@ main() {
   fi
 
   docker network inspect observability >/dev/null 2>&1 || docker network create observability >/dev/null
-  sync_repo || exit 0
 
   local env rc=0
-  for env in $ENVIRONMENTS; do
-    reconcile_env "$env" || rc=1
-    CURRENT_ENV=""
-  done
+  if sync_repo; then
+    for env in $ENVIRONMENTS; do
+      reconcile_env "$env" || rc=1
+      CURRENT_ENV=""
+    done
+  fi
+  write_metrics "$rc" "$started" || warn "could not write metrics"
   exit "$rc"
 }
 

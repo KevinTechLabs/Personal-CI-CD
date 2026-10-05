@@ -1,4 +1,10 @@
+# Recording rules and alerts. Unit tested by tests/monitoring/rules_test.yml
+# (`promtool test rules`), which CI runs on every change.
+#
+# Severities: page = notify now (high-priority push), warn = notify, look soon.
+
 groups:
+  # ---------------------------------------------------------------------------
   - name: slo
     rules:
       # Fraction of API requests answered with a 5xx over the last 2 minutes.
@@ -15,14 +21,52 @@ groups:
           histogram_quantile(0.95,
             sum by (env, le) (rate(http_request_duration_seconds_bucket{job="api"}[5m])))
 
-  - name: alerts
+  # ---------------------------------------------------------------------------
+  - name: availability
     rules:
+      - alert: EndpointDown
+        expr: probe_success{job="probe-app"} == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.env }} is not serving: /ready probe failing for 2m"
+          runbook: docs/OPERATIONS.md#troubleshooting
+
       - alert: HighErrorRatio
         expr: env:http_error_ratio:rate2m > 0.05
         for: 5m
         labels: { severity: page }
         annotations:
           summary: "{{ $labels.env }}: {{ $value | humanizePercentage }} of requests failing"
+
+      - alert: ReadinessDegraded
+        expr: min by (env, check) (readiness_check_state{job="api"}) < 2
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: "{{ $labels.env }}: dependency check '{{ $labels.check }}' not ok for 5m"
+          description: "curl http://ai-lab:<port>/ready for the per-dependency report"
+
+      - alert: WorkerHeartbeatStale
+        expr: worker_heartbeat_age_seconds{job="api"} > 60
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.env }}: no live worker (last heartbeat {{ $value | humanizeDuration }} ago); tasks are not being processed"
+
+      - alert: QueueBacklog
+        expr: queue_oldest_pending_age_seconds{job="api"} > 600
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: "{{ $labels.env }}: oldest task has waited {{ $value | humanizeDuration }}"
+
+      - alert: SlowReadinessProbe
+        expr: probe_duration_seconds{job="probe-app"} > 1
+        for: 10m
+        labels: { severity: warn }
+        annotations:
+          summary: "{{ $labels.env }}: /ready taking {{ $value | humanizeDuration }}"
 
       - alert: TargetDown
         expr: up{job=~"api|worker"} == 0
@@ -31,9 +75,101 @@ groups:
         annotations:
           summary: "{{ $labels.job }} in {{ $labels.env }} is not being scraped"
 
-      - alert: QueueBacklog
-        expr: worker_queue_depth > 100
+  # ---------------------------------------------------------------------------
+  - name: dependencies
+    rules:
+      - alert: DeployDependencyUnreachable
+        expr: probe_success{job="probe-deps"} == 0
+        for: 15m
+        labels: { severity: warn }
+        annotations:
+          summary: "AI-LAB cannot reach {{ $labels.dependency }} ({{ $labels.instance }}); deploys will stall"
+
+      - alert: ObservabilityComponentDown
+        expr: probe_success{job="probe-observability"} == 0
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: "{{ $labels.component }} is unhealthy"
+
+  # ---------------------------------------------------------------------------
+  - name: host
+    rules:
+      - alert: HostDiskAlmostFull
+        expr: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"} < 0.10
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.mountpoint }} has {{ $value | humanizePercentage }} free"
+
+      - alert: HostDiskWillFillSoon
+        expr: |
+          predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}[6h], 24 * 3600) < 0
+          and
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"} < 0.25
+        for: 30m
+        labels: { severity: warn }
+        annotations:
+          summary: "{{ $labels.mountpoint }} is on track to fill within 24h"
+
+      - alert: HostMemoryPressure
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
         for: 10m
         labels: { severity: warn }
         annotations:
-          summary: "{{ $labels.env }}: {{ $value }} tasks waiting; worker may be stuck"
+          summary: "only {{ $value | humanizePercentage }} memory available"
+
+      # Signature verification (cosign) checks certificate validity windows;
+      # a drifting clock makes valid images look invalid.
+      - alert: HostClockSkew
+        expr: abs(node_timex_offset_seconds) > 0.5 or node_timex_sync_status == 0
+        for: 10m
+        labels: { severity: warn }
+        annotations:
+          summary: "host clock is unsynchronised; image signature checks may fail"
+
+  # ---------------------------------------------------------------------------
+  - name: gitops
+    rules:
+      - alert: GitOpsAgentStale
+        expr: time() - gitops_agent_last_run_timestamp_seconds > 600
+        labels: { severity: page }
+        annotations:
+          summary: "GitOps agent hasn't completed a run in {{ $value | humanizeDuration }}; deploys and drift healing are stopped"
+          description: "systemctl status gitops-agent.timer; journalctl -u gitops-agent"
+
+      - alert: GitOpsAgentMetricsMissing
+        expr: absent(gitops_agent_last_run_timestamp_seconds)
+        for: 15m
+        labels: { severity: warn }
+        annotations:
+          summary: "no GitOps agent metrics; agent not installed, or METRICS_DIR not mounted into node-exporter"
+
+      - alert: GitOpsEnvironmentUnhealthy
+        expr: gitops_environment_state{state=~"failed|degraded"} == 1
+        for: 15m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.env }} is {{ $labels.state }} according to the GitOps agent"
+
+      - alert: GitOpsRolledBack
+        expr: increase(gitops_rollbacks_total[30m]) > 0
+        labels: { severity: warn }
+        annotations:
+          summary: "{{ $labels.env }} was automatically rolled back"
+          description: "cat /var/lib/gitops-agent/{{ $labels.env }}/status.json"
+
+  # ---------------------------------------------------------------------------
+  - name: meta
+    rules:
+      # Always firing. Alertmanager forwards it to healthchecks.io every
+      # minute; if those pings stop, healthchecks.io notifies you. This is
+      # what catches "the whole box is down".
+      - alert: Watchdog
+        expr: vector(1)
+        labels: { severity: none }
+        annotations:
+          summary: "dead man's switch; should always be firing"

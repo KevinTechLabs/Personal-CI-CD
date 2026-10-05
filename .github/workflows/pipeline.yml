@@ -63,7 +63,21 @@ jobs:
           uv run pip-audit --strict --disable-pip --require-hashes -r /tmp/requirements.txt
 
       - name: ShellCheck
-        run: shellcheck scripts/*.sh deploy/agent/*.sh tests/agent/*.sh
+        run: shellcheck scripts/*.sh deploy/agent/*.sh deploy/observability/*.sh tests/agent/*.sh
+
+      - name: actionlint (workflow files)
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+
+      - name: Monitoring config + alert rule unit tests
+        run: |
+          # Validate with the exact image versions the stack runs.
+          img() { grep -oE "$1:v[0-9.]+" deploy/observability/compose.yaml | head -1; }
+          run() { docker run --rm -v "$PWD:/w" -w /w "$@"; }
+          run --entrypoint promtool "$(img prom/prometheus)" check config deploy/observability/prometheus/prometheus.yml
+          run --entrypoint promtool "$(img prom/prometheus)" test rules tests/monitoring/rules_test.yml
+          run --entrypoint amtool "$(img prom/alertmanager)" check-config deploy/observability/alertmanager/alertmanager.yml
+          run "$(img prom/blackbox-exporter)" --config.check --config.file=deploy/observability/blackbox/blackbox.yml
+          for f in deploy/observability/grafana/dashboards/*.json; do python3 -m json.tool "$f" >/dev/null; done
 
       - name: GitOps agent scenario tests (rollback, gating, drift)
         run: |
