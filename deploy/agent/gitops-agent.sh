@@ -58,6 +58,8 @@ BACKUP_DIR="${BACKUP_DIR:-$STATE_DIR/backups}"
 BACKUP_KEEP="${BACKUP_KEEP:-14}"
 BACKUP_EVERY_HOURS="${BACKUP_EVERY_HOURS:-24}"
 HEARTBEAT_URL="${HEARTBEAT_URL:-}"
+DOWNTIME_ALERT_MINUTES="${DOWNTIME_ALERT_MINUTES:-5}"
+PROC_STAT="${PROC_STAT:-/proc/stat}"
 
 REPO_DIR="$STATE_DIR/repo"
 VERIFIED_DIGESTS="$STATE_DIR/verified-digests"
@@ -71,6 +73,7 @@ notify() {
   # goes to its activity feed; low..critical raise an alert there (high and
   # critical also reach Discord). Optional: without SENTINEL_URL it's a no-op.
   local level="$1" title="$2" text="$3" key="${4:-}" tech="${5:-}" tac="${6:-}" payload
+  NOTIFY_FAILED=0
   [[ -n "$SENTINEL_URL" && -r "$SENTINEL_KEY_FILE" ]] || return 0
   payload="$(python3 -c 'import json, sys
 k = ["source", "kind", "level", "title", "text", "key", "technique", "tactic"]
@@ -79,7 +82,9 @@ print(json.dumps({a: b for a, b in zip(k, sys.argv[1:]) if b}))' \
   # Header from a file descriptor so the key never appears in the process list.
   curl -fsS -m 10 -H @<(printf 'Authorization: Bearer %s\n' "$(tr -d '[:space:]' < "$SENTINEL_KEY_FILE")") \
     -H 'Content-Type: application/json' -d "$payload" \
-    "$SENTINEL_URL/api/ingest/event" >/dev/null || warn "could not reach Sentinel"
+    "$SENTINEL_URL/api/ingest/event" >/dev/null && return 0
+  warn "could not reach Sentinel"
+  NOTIFY_FAILED=1
 }
 
 heartbeat() {
@@ -90,6 +95,48 @@ heartbeat() {
   # or not), so a crashed or hung agent also stops the pings. Optional.
   [[ -n "$HEARTBEAT_URL" ]] || return 0
   curl -fsS -m 10 --retry 2 -o /dev/null "$HEARTBEAT_URL" || warn "could not reach heartbeat URL"
+}
+
+check_downtime() {
+  # Runs at the start of every agent run. The timer fires ~60s after the
+  # previous run ends, so a gap much longer than that means this host (or
+  # the agent) was down. Sentinel runs on this host too, so it couldn't be
+  # told at the time; it's told now, after the fact. The report is kept
+  # until Sentinel accepts it (Sentinel may still be starting after a boot).
+  local alive="$STATE_DIR/last-alive" pending="$STATE_DIR/downtime-pending"
+  local now last boot gap
+  now="$(date +%s)"
+  last="$(cat "$alive" 2>/dev/null || true)"
+  echo "$now" > "$alive"
+  if [[ "$last" =~ ^[0-9]+$ && ! -f "$pending" ]]; then
+    gap=$((now - last))
+    if ((gap > DOWNTIME_ALERT_MINUTES * 60)); then
+      boot="$(awk '/^btime/ {print $2}' "$PROC_STAT" 2>/dev/null || true)"
+      if [[ "$boot" =~ ^[0-9]+$ ]] && ((boot > last)); then
+        printf 'reboot %s %s %s\n' "$last" "$now" "$boot" > "$pending"
+      else
+        printf 'stopped %s %s -\n' "$last" "$now" > "$pending"
+      fi
+    fi
+  fi
+  [[ -f "$pending" ]] || return 0
+
+  local kind from to booted mins span
+  read -r kind from to booted < "$pending"
+  mins=$(( (to - from) / 60 ))
+  span="$(date -d "@$from" '+%F %H:%M') → $(date -d "@$to" '+%H:%M %Z')"
+  if [[ "$kind" == reboot ]]; then
+    log "host was down for ${mins}m ($span), rebooted at $(date -d "@$booted" '+%H:%M')"
+    notify high "$SENTINEL_SOURCE was offline for ${mins}m" \
+      "No agent runs $span; the machine rebooted at $(date -d "@$booted" '+%H:%M') (power loss, crash or restart). Everything on it, Sentinel included, was down; containers have restarted. Check: journalctl --list-boots" \
+      "downtime:$from" T1529 Impact
+  else
+    log "agent did not run for ${mins}m ($span); the host stayed up"
+    notify medium "GitOps agent on $SENTINEL_SOURCE didn't run for ${mins}m" \
+      "No agent runs $span, but the machine didn't reboot: the timer was stopped (paused deploys?) or the agent hung. Check: systemctl status gitops-agent.timer" \
+      "downtime:$from" T1489 Impact
+  fi
+  ((NOTIFY_FAILED)) || rm -f "$pending"
 }
 
 bump() { # bump <file>: increment a persisted counter
@@ -607,6 +654,8 @@ main() {
     exit 0
   fi
 
+  check_downtime || warn "downtime check failed"
+
   docker network inspect observability >/dev/null 2>&1 || docker network create observability >/dev/null
 
   local env rc=0
@@ -619,6 +668,7 @@ main() {
     done
   fi
   write_metrics "$rc" "$started" || warn "could not write metrics"
+  date +%s > "$STATE_DIR/last-alive"
   heartbeat
   exit "$rc"
 }

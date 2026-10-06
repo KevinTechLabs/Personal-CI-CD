@@ -127,13 +127,22 @@ critical ones reach your Discord through Sentinel's existing webhook.
 dies, the heartbeat stops and Sentinel raises *Monitoring on ai-lab stopped
 reporting* (within ~4–5 minutes), then closes it when the heartbeat returns.
 
-**Layer 2: off-box heartbeat (healthchecks.io).** Sentinel and NexusLab both
-live on kevin-ai, so if the whole box dies (power, kernel panic, network,
-the house's internet) they die with it and nothing on kevin-ai can tell you.
-The GitOps agent therefore also pings an external monitor after every run:
+**Layer 2: the machine itself.** Sentinel and NexusLab both live on
+kevin-ai, so if the whole box dies (power, kernel panic, network) they die
+with it and can't be told at the time. Two things cover that:
 
-1. Sign up at <https://healthchecks.io> (free) and set up the iOS/Android app
-   or email under *Integrations*.
+- **In Sentinel, afterwards.** The agent runs every minute; when it finds it
+  hasn't run for more than 5 minutes (`DOWNTIME_ALERT_MINUTES`), it raises
+  *ai-lab was offline for 47m* (high, ATT&CK T1529) if the machine rebooted,
+  or *GitOps agent didn't run* (medium) if only the agent was stopped. If
+  Sentinel is still starting after a boot, the report waits and is sent on
+  the next run. Nothing to set up.
+- **Live, in Discord (healthchecks.io).** The agent also pings an external
+  monitor after every run. If the pings stop, it posts to the same Discord
+  channel as Sentinel's high/critical alerts, from outside the house:
+
+1. Sign up at <https://healthchecks.io> (free). Under *Integrations*, add
+   **Discord** and choose Sentinel's alert channel.
 2. *Add Check*: name `kevin-ai`, period **1 minute**, grace **10 minutes**
    (a run that soaks both environments can take ~7).
 3. Copy its ping URL into the agent's config and test it:
@@ -144,9 +153,10 @@ The GitOps agent therefore also pings an external monitor after every run:
    ```
 
 If the pings stop for 10 minutes (machine down, offline, or the agent hung)
-you get a notification that doesn't depend on anything at home. A failed
-*deploy* still pings: that's Sentinel's job; this check only answers "is
-kevin-ai alive?". The ping URL only lets someone mark the check as up, so
+Discord gets a message that doesn't depend on anything at home; when
+kevin-ai is back, healthchecks.io posts the recovery and Sentinel gets the
+"was offline" alert with exact times. A failed *deploy* still pings: that's
+Sentinel's job; this check only answers "is kevin-ai alive?". The ping URL only lets someone mark the check as up, so
 it's low-risk, but it stays in `agent.env` (not committed) all the same.
 
 Watch it work:
@@ -274,6 +284,10 @@ sudo systemctl start gitops-agent
 sudo systemctl stop gitops-agent.timer     # running stacks are untouched
 sudo systemctl start gitops-agent.timer
 ```
+
+Pauses longer than 5 minutes show up in Sentinel afterwards as a medium
+"agent didn't run" alert (and in Discord via healthchecks.io after 10), so
+an accidental pause doesn't go unnoticed. Close it in Sentinel if it was you.
 
 ### Demonstrate auto-rollback
 
