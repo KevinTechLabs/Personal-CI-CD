@@ -69,6 +69,10 @@ cat > "$BIN/curl" <<'EOF'
 #!/usr/bin/env bash
 # Answers /ready, /version and Prometheus queries from the stub state.
 url=""; for a in "$@"; do [[ "$a" == http* ]] && url="$a"; done
+if [[ "$url" == https://hc.test/* ]]; then   # off-box heartbeat
+  [[ -f "$MOCK/heartbeat-down" ]] && exit 7
+  echo "$url" >> "$MOCK/heartbeat.log"; exit 0
+fi
 if [[ "$url" == http://sentinel.test/* ]]; then   # record what the agent sends to Sentinel
   echo "$*" >> "$MOCK/sentinel-args.log"
   prev=""; for a in "$@"; do
@@ -136,6 +140,7 @@ COSIGN_IDENTITY_REGEXP=test
 SENTINEL_URL=http://sentinel.test
 BACKUP_KEEP=3
 SENTINEL_KEY_FILE=$WORK/sentinel_key
+HEARTBEAT_URL=https://hc.test/ping/abc
 EOF
 echo "s3cret-ingest-key-abcdef" > "$WORK/sentinel_key"
 
@@ -317,5 +322,26 @@ agent
 check "DORA: lead time recorded for the real commit" "$(metric 'gitops_lead_time_seconds_count{env="staging"}')" 1.0
 check "DORA: lead time is commit-to-running (~1h)" \
   "$(python3 -c 'import sys; print(3590 <= float(sys.argv[1]) < 3700)' "$(metric 'gitops_lead_time_seconds_sum{env="staging"}')")" True
+
+# --- off-box heartbeat ----------------------------------------------------------
+beats() { wc -l < "$MOCK/heartbeat.log" 2>/dev/null || echo 0; }
+before="$(beats)"
+agent
+check "heartbeat sent after a quiet run" "$(( $(beats) - before ))" 1
+before="$(beats)"
+touch "$MOCK/notready-bbbbeee1"; promote bbbbeee1 staging 12
+agent
+check "heartbeat still sent when a deploy fails (liveness, not health)" "$(( $(beats) - before ))" 1
+check "...and the failed deploy was rolled back" "$(running staging)" "$real"
+touch "$MOCK/heartbeat-down"
+hb_rc=0
+PATH="$BIN:$PATH" GITOPS_AGENT_CONFIG="$WORK/agent.env" "$ROOT/deploy/agent/gitops-agent.sh" >> "$WORK/agent.log" 2>&1 || hb_rc=$?
+check "unreachable heartbeat service doesn't fail the run" "$hb_rc" 0
+rm -f "$MOCK/heartbeat-down"
+exec 8>"$STATE/lock"; flock -n 8
+before="$(beats)"
+agent
+check "no heartbeat while another run holds the lock (a hung agent goes silent)" "$(( $(beats) - before ))" 0
+exec 8>&-
 
 echo "all $PASS agent scenario checks passed"

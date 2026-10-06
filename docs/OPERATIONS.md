@@ -127,21 +127,27 @@ critical ones reach your Discord through Sentinel's existing webhook.
 dies, the heartbeat stops and Sentinel raises *Monitoring on ai-lab stopped
 reporting* (within ~4–5 minutes), then closes it when the heartbeat returns.
 
-**Layer 2: something on another machine.** Sentinel lives on kevin-ai too,
-so if the whole box dies (power, kernel panic, network), Sentinel dies with it
-and nothing on kevin-ai can tell you. Watch it from another always-on machine
-that already posts to Discord:
+**Layer 2: off-box heartbeat (healthchecks.io).** Sentinel and NexusLab both
+live on kevin-ai, so if the whole box dies (power, kernel panic, network,
+the house's internet) they die with it and nothing on kevin-ai can tell you.
+The GitOps agent therefore also pings an external monitor after every run:
 
-- **NexusLab hub** (if it runs on another machine): its agent on kevin-ai
-  already gives you *machine offline* alerts. With the agent in Docker
-  `monitor` mode it also reports stopped containers (Prometheus, Alertmanager,
-  the app stacks).
-- **Uptime Kuma** (on the mini PC): add an HTTP monitor for
-  `http://kevin-ai:8088/api/health`. That's Sentinel itself, the one service
-  whose failure would otherwise be silent.
+1. Sign up at <https://healthchecks.io> (free) and set up the iOS/Android app
+   or email under *Integrations*.
+2. *Add Check*: name `kevin-ai`, period **1 minute**, grace **10 minutes**
+   (a run that soaks both environments can take ~7).
+3. Copy its ping URL into the agent's config and test it:
 
-Between the two, every failure has a path to Discord that doesn't run on the
-machine that failed.
+   ```bash
+   sudo nano /etc/gitops-agent/agent.env        # HEARTBEAT_URL=https://hc-ping.com/<uuid>
+   sudo systemctl start gitops-agent             # one run now; the check turns green
+   ```
+
+If the pings stop for 10 minutes (machine down, offline, or the agent hung)
+you get a notification that doesn't depend on anything at home. A failed
+*deploy* still pings: that's Sentinel's job; this check only answers "is
+kevin-ai alive?". The ping URL only lets someone mark the check as up, so
+it's low-risk, but it stays in `agent.env` (not committed) all the same.
 
 Watch it work:
 
