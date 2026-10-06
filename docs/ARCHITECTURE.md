@@ -216,12 +216,16 @@ It closes itself when heartbeats resume. This was drilled end-to-end against
 real Prometheus and Alertmanager binaries.
 
 Sentinel runs on the same machine (kevin-ai), so a dead *machine* takes
-Sentinel down too. That last layer is off-box: after every run the GitOps
-agent pings an external dead man's switch (healthchecks.io), which alerts
-the phone if the pings stop. It runs outside the house, so it still works
-when kevin-ai, the network or the power is gone, and because the ping comes
-at the *end* of a run, a hung or crashing agent goes silent too. Each
-failure has a reporting path that doesn't share its fate. Every alert has a `promtool` unit test in
+Sentinel down too, so that layer is split in two. *Live*: after every run
+the GitOps agent pings an external dead man's switch (healthchecks.io); if
+the pings stop it posts to Sentinel's Discord channel from outside the
+house, so it still works when kevin-ai, the network or the power is gone,
+and because the ping comes at the *end* of a run, a hung or crashing agent
+goes silent too. *Record*: each run notes when it last ran; a gap of more
+than 5 minutes is reported to Sentinel once it's reachable again, as a
+reboot (checked against the kernel's boot time) or a stopped agent, so
+every outage ends up in the inbox with exact times. Each failure has a
+reporting path that doesn't share its fate. Every alert has a `promtool` unit test in
 `tests/monitoring/rules_test.yml`, so rule changes can't silently break
 alerting.
 

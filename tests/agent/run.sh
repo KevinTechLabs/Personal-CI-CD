@@ -74,6 +74,7 @@ if [[ "$url" == https://hc.test/* ]]; then   # off-box heartbeat
   echo "$url" >> "$MOCK/heartbeat.log"; exit 0
 fi
 if [[ "$url" == http://sentinel.test/* ]]; then   # record what the agent sends to Sentinel
+  [[ -f "$MOCK/sentinel-down" ]] && exit 7
   echo "$*" >> "$MOCK/sentinel-args.log"
   prev=""; for a in "$@"; do
     [[ "$prev" == -d ]] && echo "$a" >> "$MOCK/sentinel.jsonl"
@@ -141,7 +142,9 @@ SENTINEL_URL=http://sentinel.test
 BACKUP_KEEP=3
 SENTINEL_KEY_FILE=$WORK/sentinel_key
 HEARTBEAT_URL=https://hc.test/ping/abc
+PROC_STAT=$WORK/proc-stat
 EOF
+echo "btime 1000" > "$WORK/proc-stat"   # booted long ago
 echo "s3cret-ingest-key-abcdef" > "$WORK/sentinel_key"
 
 agent() {
@@ -343,5 +346,32 @@ before="$(beats)"
 agent
 check "no heartbeat while another run holds the lock (a hung agent goes silent)" "$(( $(beats) - before ))" 0
 exec 8>&-
+
+# --- downtime reported to Sentinel after the fact ---------------------------------
+downs() { sentinel 'sum(1 for e in E if e.get("key","").startswith("downtime:"))'; }
+check "no downtime alert during normal operation" "$(downs)" 0
+echo $(( $(date +%s) - 3600 )) > "$STATE/last-alive"          # last run an hour ago...
+echo "btime $(( $(date +%s) - 600 ))" > "$WORK/proc-stat"      # ...and booted 10 min ago
+touch "$MOCK/sentinel-down"                                     # Sentinel still starting
+agent
+check "downtime report kept while Sentinel is unreachable" "$([[ -f "$STATE/downtime-pending" ]] && echo kept)" kept
+check "...and not sent yet" "$(downs)" 0
+rm -f "$MOCK/sentinel-down"
+agent
+check "reboot reported to Sentinel once it's back" \
+  "$(sentinel '[(e["level"], e["technique"]) for e in E if e.get("key","").startswith("downtime:")]')" "[('high', 'T1529')]"
+check "reboot alert says how long" "$(sentinel '[e["title"] for e in E if e.get("key","").startswith("downtime:")][0]')" "ai-lab was offline for 60m"
+check "pending report cleared after delivery" "$([[ -f "$STATE/downtime-pending" ]] && echo kept || echo cleared)" cleared
+agent
+check "reported only once" "$(downs)" 1
+echo $(( $(date +%s) - 1200 )) > "$STATE/last-alive"          # 20 min gap...
+echo "btime 1000" > "$WORK/proc-stat"                          # ...but no reboot
+agent
+check "stopped agent (no reboot) is a medium alert" \
+  "$(sentinel '[e["level"] for e in E if e.get("key","").startswith("downtime:")][-1]')" medium
+before="$(downs)"
+echo $(( $(date +%s) - 120 )) > "$STATE/last-alive"           # 2 min: a normal long run
+agent
+check "short gaps are not downtime" "$(downs)" "$before"
 
 echo "all $PASS agent scenario checks passed"
