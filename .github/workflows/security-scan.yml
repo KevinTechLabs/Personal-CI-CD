@@ -68,9 +68,14 @@ jobs:
     needs: targets
     if: needs.targets.outputs.any == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       security-events: write
+    env:
+      # Pull Trivy's vulnerability database from mirrors first; the default
+      # (ghcr.io) is rate limited and can stall a scan.
+      TRIVY_DB_REPOSITORY: mirror.gcr.io/aquasec/trivy-db:2,public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
@@ -167,9 +172,11 @@ jobs:
         run: |
           existing="$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq '.[0].number // empty')"
           failed=()
-          [[ "$TARGETS"  == "failure" ]] && failed+=("could not read deployed releases")
-          [[ "$DEPLOYED" == "failure" ]] && failed+=("deployed image: fixable CRITICAL/HIGH vulnerability or invalid signature")
-          [[ "$LOCKFILE" == "failure" ]] && failed+=("Python dependency with a known vulnerability")
+          # "cancelled" counts too: a scan that never finished proves nothing.
+          bad() { [[ "$1" == "failure" || "$1" == "cancelled" ]]; }
+          bad "$TARGETS"  && failed+=("could not read deployed releases ($TARGETS)")
+          bad "$DEPLOYED" && failed+=("deployed image: fixable CRITICAL/HIGH vulnerability, invalid signature, or scan did not finish ($DEPLOYED)")
+          bad "$LOCKFILE" && failed+=("Python dependency with a known vulnerability ($LOCKFILE)")
 
           if ((${#failed[@]})); then
             body="$(printf -- '- %s\n' "${failed[@]}")"
