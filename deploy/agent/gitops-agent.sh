@@ -57,6 +57,7 @@ BACKUP_ENVIRONMENTS="${BACKUP_ENVIRONMENTS:-production}"
 BACKUP_DIR="${BACKUP_DIR:-$STATE_DIR/backups}"
 BACKUP_KEEP="${BACKUP_KEEP:-14}"
 BACKUP_EVERY_HOURS="${BACKUP_EVERY_HOURS:-24}"
+HEARTBEAT_URL="${HEARTBEAT_URL:-}"
 
 REPO_DIR="$STATE_DIR/repo"
 VERIFIED_DIGESTS="$STATE_DIR/verified-digests"
@@ -79,6 +80,16 @@ print(json.dumps({a: b for a, b in zip(k, sys.argv[1:]) if b}))' \
   curl -fsS -m 10 -H @<(printf 'Authorization: Bearer %s\n' "$(tr -d '[:space:]' < "$SENTINEL_KEY_FILE")") \
     -H 'Content-Type: application/json' -d "$payload" \
     "$SENTINEL_URL/api/ingest/event" >/dev/null || warn "could not reach Sentinel"
+}
+
+heartbeat() {
+  # Off-box dead man's switch: tells an external monitor (e.g. healthchecks.io)
+  # "this host and its agent are alive". Sentinel runs on this same machine,
+  # so it can't report the machine itself going down; the external monitor
+  # alerts you when these pings stop. Sent at the end of every run (deploy
+  # or not), so a crashed or hung agent also stops the pings. Optional.
+  [[ -n "$HEARTBEAT_URL" ]] || return 0
+  curl -fsS -m 10 --retry 2 -o /dev/null "$HEARTBEAT_URL" || warn "could not reach heartbeat URL"
 }
 
 bump() { # bump <file>: increment a persisted counter
@@ -608,6 +619,7 @@ main() {
     done
   fi
   write_metrics "$rc" "$started" || warn "could not write metrics"
+  heartbeat
   exit "$rc"
 }
 
