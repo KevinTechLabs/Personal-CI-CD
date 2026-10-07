@@ -4,10 +4,13 @@
 
 Please **don't open a public issue** for security problems.
 
-Report it privately through GitHub instead: **Security → Report a
-vulnerability** on this repository. Include what you found, how to reproduce
+Report it privately through GitHub instead:
+<https://github.com/KevinTechLabs/Personal-CI-CD/security/advisories/new>
+(**Security → Report a vulnerability**). See GitHub's guide to
+[privately reporting a security vulnerability](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability). Include what you found, how to reproduce
 it, and what an attacker could do with it. You'll get a reply within a few
-days, and a fix or an explanation as soon as possible after that.
+days, and a fix or an explanation as soon as possible after that. Please
+allow up to 90 days for a fix before disclosing the issue publicly.
 
 ## Supported versions
 

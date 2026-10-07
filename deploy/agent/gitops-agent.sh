@@ -206,10 +206,12 @@ readiness() {
   # readiness <port> <version>: prints "ok" or the reason the release isn't
   # ready yet. Understands both /ready formats so rolling back to a release
   # that predates the per-dependency report still works.
-  local port="$1" want="$2" body api_version
+  local port="$1" want="$2" body api_version version_json
   body="$(curl -fsS -m 3 "http://127.0.0.1:$port/ready" 2>/dev/null)" || { echo "/ready not 200"; return; }
-  api_version="$(curl -fsS -m 3 "http://127.0.0.1:$port/version" 2>/dev/null \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || true)"
+  # Fetch, then parse: never pipe a download straight into an interpreter.
+  version_json="$(curl -fsS -m 3 "http://127.0.0.1:$port/version" 2>/dev/null || true)"
+  api_version="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' \
+    <<<"$version_json" 2>/dev/null || true)"
   python3 - "$body" "$want" "$api_version" <<'PY'
 import json, sys
 body, want, api_version = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3]
