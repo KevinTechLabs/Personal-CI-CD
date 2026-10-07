@@ -1,6 +1,6 @@
-# Operations runbook
+# 📘 Operations runbook
 
-## Hosts
+## 🖥️ Hosts
 
 | Host | Role |
 |---|---|
@@ -12,7 +12,7 @@ REACTOR doesn't need to be on: GitHub builds and promotes, kevin-ai pulls.
 
 ---
 
-## One-time setup
+## 🛠️ One-time setup
 
 ### 1. Generate the lockfile (REACTOR)
 
@@ -194,9 +194,9 @@ journalctl -fu gitops-agent
 
 ---
 
-## Day-to-day
+## 📅 Day-to-day
 
-### Ship a change
+### 🚢 Ship a change
 
 ```bash
 git checkout -b my-change
@@ -206,7 +206,7 @@ git push -u origin my-change     # open a PR: quality + tests + build/scan/smoke
 # merge → staging deploys itself → approve production when happy
 ```
 
-### Where is each environment?
+### 📍 Where is each environment?
 
 ```bash
 cat /var/lib/gitops-agent/staging/status.json
@@ -218,7 +218,7 @@ git log --oneline origin/environments      # full deployment history
 `state` is one of `deployed`, `deploying`, `waiting` (production awaiting a
 staging-verified digest), `rolled_back`, `failed`, `degraded`.
 
-### Is everything healthy?
+### 💚 Is everything healthy?
 
 ```bash
 curl -s localhost:8081/ready | python3 -m json.tool   # per-dependency report
@@ -228,14 +228,14 @@ curl -s localhost:9093/api/v2/alerts | python3 -c 'import json,sys; [print(a["la
 Or open Grafana → *Personal CI/CD: Platform health*. The Watchdog alert is
 always listed (that's the dead man's switch working); anything else is real.
 
-### Silence an alert during maintenance
+### 🔕 Silence an alert during maintenance
 
 ```bash
 docker exec observability-alertmanager-1 amtool --alertmanager.url=http://localhost:9093 \
   silence add alertname=EndpointDown env=staging --duration=1h --comment="planned work"
 ```
 
-### Database backups
+### 💾 Database backups
 
 Production is backed up before every migration and once a day (configure in
 `agent.env`: `BACKUP_ENVIRONMENTS`, `BACKUP_KEEP`, `BACKUP_EVERY_HOURS`).
@@ -257,7 +257,7 @@ Off-box copies: backups live on AI-LAB's disk. For protection against losing
 the disk, sync `/var/lib/gitops-agent/backups` elsewhere (e.g. `rsync` over
 Tailscale to another machine, or `restic` to cloud storage) from a cron job.
 
-### Delivery metrics (DORA)
+### 📈 Delivery metrics (DORA)
 
 Grafana → *Platform health* → **Delivery performance** shows the four DORA
 metrics per environment, colored by DORA performance tier: deployment
@@ -265,7 +265,7 @@ frequency, lead time for changes, change failure rate (rollbacks count as
 failures) and time to restore. They're computed from the agent's own
 counters, so they start filling in after the first deploys.
 
-### Scheduled security scan
+### 🔍 Scheduled security scan
 
 Runs Monday and Thursday (and on demand: *Actions → Scheduled security scan →
 Run workflow*). If it finds a problem it opens one issue labeled
@@ -280,7 +280,7 @@ proves nothing. One-off red runs (a stalled download, a failed SARIF upload)
 are usually GitHub-side: *Re-run jobs → Re-run all jobs*. If it fails again,
 read the run's **Annotations** box or the red step in the job log.
 
-### Roll back
+### ⏪ Roll back
 
 Rollback is a Git operation, like every other change:
 
@@ -295,7 +295,7 @@ git push origin environments
 The agent applies the previous release within a minute. (The ruleset allows
 this: it blocks force pushes, not new commits.)
 
-### Retry a revision the agent marked as failed
+### 🔁 Retry a revision the agent marked as failed
 
 If a failure was environmental (e.g. registry outage) rather than the release:
 
@@ -304,7 +304,7 @@ sudo rm /var/lib/gitops-agent/<env>/failed.rev
 sudo systemctl start gitops-agent
 ```
 
-### Pause deployments
+### ⏸️ Pause deployments
 
 ```bash
 sudo systemctl stop gitops-agent.timer     # running stacks are untouched
@@ -315,14 +315,14 @@ Pauses longer than 5 minutes show up in Sentinel afterwards as a medium
 "agent didn't run" alert (and in Discord via healthchecks.io after 10), so
 an accidental pause doesn't go unnoticed. Close it in Sentinel if it was you.
 
-### Demonstrate auto-rollback
+### 🎬 Demonstrate auto-rollback
 
 Set `CHAOS_ERROR_RATE=0.5` in `deploy/compose/staging.env`, merge, and watch
 the journal and Grafana: the agent detects the SLO breach during its soak
 and rolls staging back. Set it back to `0` to recover. Health probes are
 exempt from injected faults, so this exercises the SLO path specifically.
 
-### Add a database migration
+### 🧱 Add a database migration
 
 ```bash
 uv run alembic revision -m "add priority to tasks"
@@ -334,7 +334,7 @@ later release. See ARCHITECTURE.md §4.
 
 ---
 
-## Troubleshooting
+## 🔧 Troubleshooting
 
 | Symptom | Look at |
 |---|---|
@@ -369,7 +369,7 @@ later release. See ARCHITECTURE.md §4.
 
 ---
 
-## v1 history
+## 🕰️ v1 history
 
 Lessons from v1 that shaped v2:
 

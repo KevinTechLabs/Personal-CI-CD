@@ -1,9 +1,9 @@
-# Changelog
+# 📝 Changelog
 
 What changed, and why. Newest first. Deploys are `main` merges; each one
 flows through staging and, after approval, production on kevin-ai.
 
-## 2026-10-06: Outage alerting verified
+## ✅ 2026-10-06: Outage alerting verified
 
 - Tested end to end by stopping the agent's timer: healthchecks.io posted
   *kevin-ai is DOWN* to `#healthchecks-alerts` after ~11 minutes and *UP*
@@ -17,7 +17,7 @@ flows through staging and, after approval, production on kevin-ai.
   on 2026-10-19; nothing in the workflows depends on the 24.04 image, so no
   change made. If a run breaks around then, pin `runs-on: ubuntu-24.04`.
 
-## 2026-10-05: Live on kevin-ai
+## 🚀 2026-10-05: Live on kevin-ai
 
 **#7 Report kevin-ai outages to Sentinel** (`2fb049e`). Each agent run
 records when it last ran. A gap over 5 minutes is raised in Sentinel once it
@@ -49,7 +49,7 @@ to Sentinel (ingest-only key), observability stack up, Grafana on :3000.
 Every merge above went staging → soak → approval → backup → production
 with no rollbacks; the approval gate held for each production deploy.
 
-## 2026-10-04: v2 pipeline (#1)
+## 🏗️ 2026-10-04: v2 pipeline (#1)
 
 Multi-service app (FastAPI + worker + Postgres), supply-chain-secured
 pipeline (pinned actions, SBOM, cosign signatures and attestations, SLSA
