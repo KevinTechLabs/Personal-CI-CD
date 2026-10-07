@@ -38,15 +38,19 @@ Run `uv lock` again whenever you change dependencies in `pyproject.toml`.
 
 **Settings → Rules → Rulesets**
 
-- `main`: require status checks *Lint, SAST, dependency audit, secret scan*,
-  *Tests (Postgres integration)*, *Build, scan, smoke test* and *CodeQL*;
-  block force pushes. Working solo, you can still merge your own PRs.
+- `protect-main` (target: default branch): restrict deletions, block force
+  pushes, require a pull request with **0** required approvals (GitHub won't
+  let you approve your own PR, so 1+ would block every merge), and require
+  the checks *Lint, SAST, dependency audit, secret scan*, *Tests (Postgres
+  integration)* and *Build, scan, smoke test*. Direct pushes to `main` are
+  rejected; work on a branch and merge through a PR.
 - `environments`: block force pushes and deletions. This keeps the
   deployment history (your audit log) intact while still letting the
   pipeline's bot commit.
 
 **Settings → Code security**: if CodeQL *default setup* is on, switch to
-*advanced*, since this repo ships its own `codeql.yml`. Enable Dependabot alerts.
+*advanced*, since this repo ships its own `codeql.yml`. Enable Dependabot
+alerts and **Private vulnerability reporting** (`SECURITY.md` points to it).
 
 **Settings → Actions → General**: workflow permissions *read-only*. Every
 job declares what it needs.
@@ -364,6 +368,8 @@ later release. See ARCHITECTURE.md §4.
 | `sudo deploy/agent/install.sh`: Permission denied | Old checkout from before the file was made executable: `git pull` (or `sudo bash deploy/agent/install.sh`). |
 | REACTOR: `git pull` says branches "have diverged" | A local commit duplicates one already merged on GitHub. Check with `git log --oneline origin/main..main`; if it's already merged, `git reset --hard origin/main`. |
 | PR shows merge conflicts after a re-made commit | The earlier version was already merged. On the branch: `git fetch origin && git reset --soft origin/main && git commit -m "…" && git push --force-with-lease`. |
+| `git push` rejected: protected branch / "changes must be made through a pull request" | The `protect-main` ruleset working. `git checkout -b <name>`, push that, open a PR. |
+| OpenSSF Scorecard badge dropped | Click the badge: each check lists what it found. Branch-Protection at 3 is expected (see setup step 2). |
 | CI `uv lock --check` fails | Dependencies changed without re-locking: run `uv lock` and commit. |
 | Stack logs | `docker compose -p cicd-staging logs -f api worker` |
 

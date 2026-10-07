@@ -5,12 +5,23 @@ flows through staging and, after approval, production on kevin-ai.
 
 ## 🛡️ 2026-10-06: OpenSSF Scorecard improvements
 
-Scorecard was 5.7/10. Added an MIT `LICENSE` and a `SECURITY.md` (private
-vulnerability reporting), pinned the Dockerfile's base images by digest
-(Dependabot keeps tag and digest current), and protected `main` with a
-ruleset (PRs and passing checks required, no force-push or deletion).
-Not pursued: Code-Review (needs a second reviewer), Maintained (repo under
-90 days old), Contributors, Fuzzing, CII badge.
+Scorecard went from **5.7 to 6.9**/10 in two PRs:
+
+- **#10**: MIT `LICENSE` (License 0 → 10), `SECURITY.md`, Dockerfile base
+  images pinned by digest (Pinned-Dependencies 7 → 9; Dependabot keeps tag
+  and digest current), and a `protect-main` ruleset: PRs and passing checks
+  required, no force-push or deletion (Branch-Protection 0 → 3).
+- **#11**: `SECURITY.md` links the private reporting page and states a
+  90-day disclosure window (Security-Policy flagged "no linked content").
+  Two scripts piped `curl` output straight into `python3`; harmless (local
+  JSON) but indistinguishable from download-and-run, so they now fetch then
+  parse (Pinned-Dependencies 9 → 10).
+
+Left as is: Branch-Protection stays at 3 because every higher tier needs a
+required approving review, which a solo maintainer can't give their own PR.
+Code-Review, Contributors, Fuzzing and CII need other people or a lot of
+extra work. Maintained fixes itself once the repo is 90 days old (January
+2027), worth about another point.
 
 ## ✅ 2026-10-06: Outage alerting verified
 
