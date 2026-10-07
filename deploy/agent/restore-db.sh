@@ -81,7 +81,8 @@ resume
 for _ in $(seq 1 30); do
   if curl -fsS -m 3 "http://127.0.0.1:$port/ready" >/dev/null 2>&1; then
     echo "==> $env is ready:"
-    curl -fsS "http://127.0.0.1:$port/ready" | python3 -m json.tool
+    ready_json="$(curl -fsS "http://127.0.0.1:$port/ready")"
+    python3 -m json.tool <<<"$ready_json"
     echo "If anything is wrong, restore the safety backup: sudo $0 $env $safety"
     exit 0
   fi
