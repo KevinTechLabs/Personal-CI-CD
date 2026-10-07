@@ -3,6 +3,15 @@
 What changed, and why. Newest first. Deploys are `main` merges; each one
 flows through staging and, after approval, production on kevin-ai.
 
+## 🛡️ 2026-10-06: OpenSSF Scorecard improvements
+
+Scorecard was 5.7/10. Added an MIT `LICENSE` and a `SECURITY.md` (private
+vulnerability reporting), pinned the Dockerfile's base images by digest
+(Dependabot keeps tag and digest current), and protected `main` with a
+ruleset (PRs and passing checks required, no force-push or deletion).
+Not pursued: Code-Review (needs a second reviewer), Maintained (repo under
+90 days old), Contributors, Fuzzing, CII badge.
+
 ## ✅ 2026-10-06: Outage alerting verified
 
 - Tested end to end by stopping the agent's timer: healthchecks.io posted
