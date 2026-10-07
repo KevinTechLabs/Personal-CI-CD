@@ -1,9 +1,9 @@
-# Architecture
+# 🏛️ Architecture
 
 This document explains how v2 works and, more importantly, why each piece
 is shaped the way it is.
 
-## 1. The application
+## 🧩 1. The application
 
 Three processes, one image:
 
@@ -50,7 +50,7 @@ it declares a deploy successful: a release whose worker crash-loops is
 rolled back even though its API looks perfect. Rows left by killed workers
 age out of the check after 30s and are pruned after 24h.
 
-## 2. The pipeline
+## ⚙️ 2. The pipeline
 
 `.github/workflows/pipeline.yml`, least-privilege permissions per job:
 
@@ -83,7 +83,7 @@ Only jobs 4–6 hold write permissions, and only on `main`. Pull requests run
 to use 0.35.0, the one tag that was protected. Tags are mutable; commit SHAs
 aren't. Dependabot keeps the SHAs current.
 
-## 3. Pull-based GitOps
+## 🔄 3. Pull-based GitOps
 
 v1 deployed by having GitHub push work to a self-hosted runner on AI-LAB.
 For a public repository that's a real risk (a workflow change could execute
@@ -148,7 +148,7 @@ The approval gate is a human judgement; the host-side check is a mechanical
 guarantee. Even if someone approves a production job for a release that
 failed its staging soak, the agent will not deploy it.
 
-## 4. Database migrations: expand / contract
+## 🧱 4. Database migrations: expand / contract
 
 Migrations run *before* the new containers start, while the previous release
 is still serving. So every migration must work with both the old and the new
@@ -163,7 +163,7 @@ previous release is, by construction, compatible with the new schema.
 `tests/test_migrations.py` enforces a single Alembic head and a clean
 downgrade/upgrade round trip.
 
-## 5. Observability and alerting
+## 📊 5. Observability and alerting
 
 `deploy/observability/` runs Prometheus and Grafana on a shared Docker
 network called `observability`. Each environment's `api` and `worker` join
@@ -239,7 +239,7 @@ Other details:
   to keep label cardinality bounded. Probe and scrape endpoints are excluded
   so they don't dilute the SLO.
 
-## 6. Backups and delivery metrics
+## 💾 6. Backups and delivery metrics
 
 **Backups are part of the deploy.** For environments in
 `BACKUP_ENVIRONMENTS` (production by default) the agent runs `pg_dump
@@ -262,7 +262,7 @@ next successful deploy closes it, which gives time to restore. Prometheus
 turns these into the four DORA metrics (`prometheus/dora.yml`, unit tested
 separately because of its 30-day windows).
 
-## 7. Continuous dependency checking
+## 🔍 7. Continuous dependency checking
 
 Build-time scans only describe the day an image was built. The
 `security-scan` workflow (Mon/Thu) reads the digests actually deployed from
@@ -276,7 +276,7 @@ bumps the dependency → pipeline → staging → approve.
 
 OpenSSF Scorecard grades the repository's own supply-chain hygiene weekly.
 
-## 8. Security model and trade-offs
+## 🛡️ 8. Security model and trade-offs
 
 - **The docker group is root-equivalent.** The agent runs as a dedicated
   `gitops` user in that group under a hardened systemd unit. That's the
