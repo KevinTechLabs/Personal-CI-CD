@@ -5,7 +5,10 @@
 | Host | Role |
 |---|---|
 | **REACTOR** | development workstation; changes are pushed from here |
-| **AI-LAB** | runs staging (:8081), production (:8080), the GitOps agent, and the monitoring stack: Prometheus (localhost:9090), Alertmanager (localhost:9093), blackbox + node-exporter (internal), Grafana (:3000) |
+| **AI-LAB** (kevin-ai) | runs staging (:8081), production (:8080), the GitOps agent, and the monitoring stack: Prometheus (localhost:9090), Alertmanager (localhost:9093), blackbox + node-exporter (internal), Grafana (:3000). Also hosts Sentinel (:8088) and NexusLab. Runs 24/7. |
+| **healthchecks.io** | external dead man's switch for kevin-ai itself (check `kevin-ai`, posts to Discord `#healthchecks-alerts`) |
+
+REACTOR doesn't need to be on: GitHub builds and promotes, kevin-ai pulls.
 
 ---
 
@@ -138,13 +141,16 @@ with it and can't be told at the time. Two things cover that:
   Sentinel is still starting after a boot, the report waits and is sent on
   the next run. Nothing to set up.
 - **Live, in Discord (healthchecks.io).** The agent also pings an external
-  monitor after every run. If the pings stop, it posts to the same Discord
-  channel as Sentinel's high/critical alerts, from outside the house:
+  monitor after every run. If the pings stop, it posts to Discord from
+  outside the house (here: its own channel, `#healthchecks-alerts`, kept
+  apart from Sentinel's `#sentinel-alert`):
 
 1. Sign up at <https://healthchecks.io> (free). Under *Integrations*, add
-   **Discord** and choose Sentinel's alert channel.
+   **Discord** and choose the channel; press *Test!* to see a message arrive.
 2. *Add Check*: name `kevin-ai`, period **1 minute**, grace **10 minutes**
-   (a run that soaks both environments can take ~7).
+   (a run that soaks both environments can take ~7). The default period is
+   **1 day**: change the unit to *minutes*, or an outage only alerts after
+   24 hours.
 3. Copy its ping URL into the agent's config and test it:
 
    ```bash
@@ -157,7 +163,20 @@ Discord gets a message that doesn't depend on anything at home; when
 kevin-ai is back, healthchecks.io posts the recovery and Sentinel gets the
 "was offline" alert with exact times. A failed *deploy* still pings: that's
 Sentinel's job; this check only answers "is kevin-ai alive?". The ping URL only lets someone mark the check as up, so
-it's low-risk, but it stays in `agent.env` (not committed) all the same.
+it's low-risk, but it stays in `agent.env` (not committed) all the same. The
+Discord webhook URL is a secret (anyone with it can post): never commit it.
+
+**Test both layers** (verified 2026-10-06):
+
+```bash
+sudo systemctl stop gitops-agent.timer     # wait ~11 min: "kevin-ai is DOWN" in #healthchecks-alerts
+sudo systemctl start gitops-agent.timer    # within a minute: "UP" in Discord, and Sentinel raises
+                                           # "GitOps agent on ai-lab didn't run for 11m" (medium)
+```
+
+While the timer is stopped, Sentinel also shows `GitOpsAgentStale` (from
+Prometheus) and resolves it by itself once the agent runs again. Close the
+test alerts in Sentinel afterwards.
 
 Watch it work:
 
@@ -254,6 +273,13 @@ Run workflow*). If it finds a problem it opens one issue labeled
 Usual fix: merge the Dependabot PR for the flagged package (or bump it
 yourself, `uv lock`, push) and let it flow through staging → production.
 
+Each image scan has a 20-minute limit and pulls Trivy's database from
+mirrors first. A scan that is cancelled or times out counts as a failure and
+opens the issue too ("scan did not finish"): a scan that never finished
+proves nothing. One-off red runs (a stalled download, a failed SARIF upload)
+are usually GitHub-side: *Re-run jobs → Re-run all jobs*. If it fails again,
+read the run's **Annotations** box or the red step in the job log.
+
 ### Roll back
 
 Rollback is a Git operation, like every other change:
@@ -330,6 +356,14 @@ later release. See ARCHITECTURE.md §4.
 | `DeployDependencyUnreachable` | AI-LAB can't reach GHCR / GitHub / Sigstore: check DNS, internet, Tailscale exit-node settings. |
 | `HostClockSkew` | `timedatectl`; enable NTP (`sudo timedatectl set-ntp true`). Signature checks fail on a wrong clock. |
 | `Prometheus unavailable` warnings | `docker compose -f deploy/observability/compose.yaml ps`; soak falls back to readiness-only unless `REQUIRE_PROMETHEUS=true`. |
+| Sentinel: "ai-lab was offline for Nm" (high) | kevin-ai rebooted (power loss, crash, restart). `journalctl --list-boots`; `journalctl -b -1 -e` for the previous boot's last messages. Containers restart on their own. |
+| Sentinel: "GitOps agent didn't run for Nm" (medium) | The timer was stopped (paused deploys?) or the agent hung: `systemctl status gitops-agent.timer`. Close it if the pause was you. |
+| `#healthchecks-alerts`: "kevin-ai is DOWN" | kevin-ai is off, offline, or the agent stopped. From your phone: Tailscale to kevin-ai; if unreachable, it's power/network. If reachable: `systemctl status gitops-agent.timer`. |
+| healthchecks.io never alerts | Check period is in *minutes*, not the default 1 day; the Discord integration is enabled on the check (icon on its row). |
+| `could not reach heartbeat URL` in the journal | `HEARTBEAT_URL` in `/etc/gitops-agent/agent.env` mistyped, or no internet. Deploys are unaffected. |
+| `sudo deploy/agent/install.sh`: Permission denied | Old checkout from before the file was made executable: `git pull` (or `sudo bash deploy/agent/install.sh`). |
+| REACTOR: `git pull` says branches "have diverged" | A local commit duplicates one already merged on GitHub. Check with `git log --oneline origin/main..main`; if it's already merged, `git reset --hard origin/main`. |
+| PR shows merge conflicts after a re-made commit | The earlier version was already merged. On the branch: `git fetch origin && git reset --soft origin/main && git commit -m "…" && git push --force-with-lease`. |
 | CI `uv lock --check` fails | Dependencies changed without re-locking: run `uv lock` and commit. |
 | Stack logs | `docker compose -p cicd-staging logs -f api worker` |
 
