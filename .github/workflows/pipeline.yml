@@ -38,7 +38,7 @@ jobs:
           fetch-depth: 0 # full history for the secret scanner
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
@@ -95,7 +95,7 @@ jobs:
           GRAFANA_ADMIN_PASSWORD=x docker compose -f deploy/observability/compose.yaml config --quiet
 
       - name: TruffleHog (verified secrets)
-        uses: trufflesecurity/trufflehog@4dd8831c5f12599465d4d45c3c447b4018a34c85 # v3.97.9
+        uses: trufflesecurity/trufflehog@e76dff8a7e57d6df0c60ad8cbf5d5cba505a8fc9 # v3.99.2
         with:
           extra_args: --results=verified,unknown
 
@@ -124,7 +124,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
@@ -134,7 +134,7 @@ jobs:
       - name: pytest with coverage gate
         run: uv run pytest --cov --cov-report=term --cov-report=xml
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: coverage
@@ -189,7 +189,7 @@ jobs:
           ignore-unfixed: true
           severity: CRITICAL,HIGH,MEDIUM
 
-      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+      - uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
         if: always() && hashFiles('trivy.sarif') != ''
         with:
           sarif_file: trivy.sarif
@@ -235,7 +235,7 @@ jobs:
 
       # The publish job pushes these exact bytes: what was scanned and smoke
       # tested is what gets signed and deployed, with no rebuild in between.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
           name: image
@@ -259,7 +259,7 @@ jobs:
     env:
       IMAGE: ${{ needs.build.outputs.image }}
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: image
 
