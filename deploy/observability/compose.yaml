@@ -30,7 +30,7 @@ x-hardening: &hardening
 services:
   prometheus:
     <<: *hardening
-    image: prom/prometheus:v3.15.0
+    image: prom/prometheus:v3.15.1
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.retention.time=30d
